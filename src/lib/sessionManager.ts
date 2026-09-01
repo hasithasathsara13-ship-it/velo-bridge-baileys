@@ -250,7 +250,7 @@ export class Session {
 
     let textContent = "";
     let mediaUrl: string | null = null;
-    let mediaType: "audio" | "image" | null = null;
+    let mediaType: "audio" | "image" | "document" | null = null;
     let caption = "";
 
     const isMedia = Boolean(content.imageMessage || content.audioMessage || content.videoMessage || content.documentMessage);
@@ -280,6 +280,10 @@ export class Session {
             mediaType = "audio";
           } else if (content.imageMessage || mime.startsWith("image/")) {
             mediaType = "image";
+          } else if (mime === "application/pdf" || content.documentMessage) {
+            // Bank receipts and invoices are usually PDFs — pass them to the
+            // bot so it can read and verify them (Gemini handles PDF natively).
+            mediaType = "document";
           }
           console.log(`[msg] media uploaded: type=${mediaType}, mime=${mime}, url=${url.slice(0, 80)}`);
         } else {
@@ -315,7 +319,7 @@ export class Session {
 
   // ─── Bot Trigger ─────────────────────────────────────────────────────────
 
-  private async triggerBot(shopId: string, phone: string, text: string, mediaType: "audio" | "image" | null, mediaUrl: string | null): Promise<void> {
+  private async triggerBot(shopId: string, phone: string, text: string, mediaType: "audio" | "image" | "document" | null, mediaUrl: string | null): Promise<void> {
     const frontendUrl = process.env.FRONTEND_URL?.trim();
     const bridgeSecret = process.env.BRIDGE_SECRET?.trim() || "";
     if (!frontendUrl) return;

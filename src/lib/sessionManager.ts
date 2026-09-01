@@ -176,10 +176,10 @@ export class Session {
     if (connection === "close") {
       const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
-      this.info.status = "disconnected";
-      await this.markConnected(false);
 
       if (loggedOut) {
+        this.info.status = "disconnected";
+        await this.markConnected(false);
         console.log(`[session ${this.info.shopId}] logged out — clearing auth`);
         try {
           fs.rmSync(this.authDir, { recursive: true, force: true });
@@ -188,11 +188,19 @@ export class Session {
         return;
       }
 
-      // Any other close reason: reconnect (this is Baileys' expected pattern —
-      // the library does not auto-reconnect on its own).
+      // Any other close reason (including the expected "restart required"
+      // Baileys sends right after a QR/pairing scan) means we're about to
+      // open a fresh socket and reconnect automatically. Report "connecting"
+      // rather than "disconnected" here — the frontend treats "disconnected"
+      // as a final state and stops polling, which would otherwise strand the
+      // UI on the QR screen even though the bridge goes on to connect
+      // successfully a few seconds later.
+      this.info.status = "connecting";
+      await this.markConnected(false);
+
       if (!this.reconnecting) {
         this.reconnecting = true;
-        console.warn(`[session ${this.info.shopId}] connection closed — reconnecting...`);
+        console.warn(`[session ${this.info.shopId}] connection closed (reconnecting) — reason: ${statusCode ?? "unknown"}`);
         setTimeout(() => {
           this.reconnecting = false;
           this.connect().catch((e) => console.error(`[session ${this.info.shopId}] reconnect failed:`, e));

@@ -43,6 +43,7 @@ function extForMime(mime: string): string {
   if (m === "image/jpeg") return "jpg";
   if (m === "image/png") return "png";
   if (m === "image/webp") return "webp";
+  if (m === "application/pdf") return "pdf";
   if (m.includes("ogg") || m.includes("opus")) return "ogg";
   if (m.includes("mpeg")) return "mp3";
   if (m.includes("mp4") || m.includes("m4a")) return "m4a";

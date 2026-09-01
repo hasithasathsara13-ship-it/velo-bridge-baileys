@@ -4,6 +4,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   downloadMediaMessage,
   makeCacheableSignalKeyStore,
+  normalizeMessageContent,
   type WASocket,
   type WAMessage,
   type ConnectionState,
@@ -234,7 +235,13 @@ export class Session {
       if (this.processedMsgIds.size > 1000) this.processedMsgIds.clear();
     }
 
-    const content = msg.message;
+    // Unwrap envelope types (documentWithCaptionMessage, viewOnceMessage,
+    // ephemeralMessage, editedMessage, …) so the real content (e.g. the
+    // actual documentMessage) is what we check below. Without this, a PDF
+    // sent normally from the WhatsApp app arrives wrapped in
+    // documentWithCaptionMessage and is silently dropped as an empty text
+    // message.
+    const content = normalizeMessageContent(msg.message);
     if (!content) return;
 
     const type = Object.keys(content)[0] || "";

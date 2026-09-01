@@ -84,6 +84,9 @@ export class Session {
   private saveCreds: (() => Promise<void>) | null = null;
   private reconnecting = false;
   private processedMsgIds = new Set<string>();
+  // Remember the exact jid a phone number last messaged from (handles @lid
+  // contacts that can only be reached via their lid jid, not phone@s.whatsapp.net).
+  private phoneToChatJid = new Map<string, string>();
 
   constructor(shopId: string, phoneForPairing?: string) {
     this.info = { shopId, status: "connecting", qrCode: null, pairingCode: null, phoneNumber: null };
@@ -202,9 +205,12 @@ export class Session {
 
   private resolveRealNumber(msg: WAMessage): string {
     const jid = msg.key.remoteJid || "";
-    // Baileys jids are usually <digits>@s.whatsapp.net, or <digits>@lid for
-    // privacy-mode contacts. Either way the digits before @ are usable —
-    // WhatsApp accepts sending back to the same jid we received from.
+    // Privacy-mode contacts show up as <lid>@lid instead of <phone>@s.whatsapp.net.
+    // Baileys attaches the real phone-number jid as senderPn/participantPn on the
+    // message key in that case — prefer it so the dashboard/bot show the actual
+    // number, not the internal LID.
+    const pn = msg.key.senderPn || msg.key.participantPn || "";
+    if (pn) return pn.split("@")[0].replace(/\D/g, "");
     return jid.split("@")[0].replace(/\D/g, "");
   }
 
@@ -230,13 +236,19 @@ export class Session {
     const phone = this.resolveRealNumber(msg);
     if (!phone) return;
 
+    // Remember which exact jid this phone number messaged from, so replies
+    // (especially to @lid contacts) go back to the correct chat.
+    this.phoneToChatJid.set(phone, jid);
+
     let textContent = "";
     let mediaUrl: string | null = null;
     let mediaType: "audio" | "image" | null = null;
+    let caption = "";
 
     const isMedia = Boolean(content.imageMessage || content.audioMessage || content.videoMessage || content.documentMessage);
 
     if (isMedia) {
+      caption = content.imageMessage?.caption || content.videoMessage?.caption || "";
       try {
         const buffer = (await downloadMediaMessage(
           msg,
@@ -262,6 +274,8 @@ export class Session {
             mediaType = "image";
           }
           console.log(`[msg] media uploaded: type=${mediaType}, mime=${mime}, url=${url.slice(0, 80)}`);
+        } else {
+          console.warn(`[msg] media upload returned no URL — mime=${mime}`);
         }
       } catch (e: any) {
         console.warn(`[msg] media download failed:`, e?.message || e);
@@ -269,9 +283,6 @@ export class Session {
       if (!textContent) {
         textContent = content.audioMessage ? "🎤 Voice message" : "📎 Media";
       }
-      // Caption on image/video, if present, is still useful text for the bot.
-      const caption = content.imageMessage?.caption || content.videoMessage?.caption || "";
-      if (caption) textContent = mediaUrl ? textContent : caption;
     } else {
       textContent = (content.conversation || content.extendedTextMessage?.text || "").trim();
     }
@@ -287,8 +298,8 @@ export class Session {
     if (msgId) row.wa_message_id = msgId;
     await sb.from("messages").insert(row);
 
-    const rawBodyForBot = content.conversation || content.extendedTextMessage?.text || "";
-    const textForBot = isMedia && !mediaType ? "" : (rawBodyForBot.trim() || textContent);
+    // Text sent to the bot: the caption for media, or the plain text body otherwise.
+    const textForBot = isMedia && !mediaType ? "" : (caption.trim() || textContent);
     if (textForBot || mediaType) {
       await this.triggerBot(shopId, phone, textForBot, mediaType, mediaUrl).catch((e) => console.error("[bot]", e));
     }
@@ -348,9 +359,15 @@ export class Session {
 
   // ─── Send Methods ────────────────────────────────────────────────────────
 
-  /** Resolve a bare phone number to the correct outbound JID. */
+  /**
+   * Resolve a bare phone number to the correct outbound JID. Prefers the exact
+   * jid we last saw this phone number message from — critical for @lid
+   * contacts, since phone@s.whatsapp.net does not reach them.
+   */
   private toJid(phone: string): string {
     const digits = phone.replace(/\D/g, "");
+    const remembered = this.phoneToChatJid.get(digits);
+    if (remembered) return remembered;
     return `${digits}@s.whatsapp.net`;
   }
 
@@ -364,8 +381,19 @@ export class Session {
   async sendImage(phone: string, imageUrl: string, caption?: string): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
     const jid = this.toJid(phone);
-    const sent = await this.sock.sendMessage(jid, { image: { url: imageUrl }, caption: caption || undefined });
-    return { id: sent?.key?.id || "" };
+    try {
+      // Fetch the bytes ourselves — more reliable than letting Baileys fetch a
+      // remote URL, which can fail silently on redirects/slow responses.
+      const res = await fetch(imageUrl);
+      if (!res.ok) throw new Error(`Failed to fetch image_url: ${res.status}`);
+      const buffer = Buffer.from(await res.arrayBuffer());
+      const sent = await this.sock.sendMessage(jid, { image: buffer, caption: caption || undefined });
+      return { id: sent?.key?.id || "" };
+    } catch (err) {
+      console.error(`[session ${this.info.shopId}] sendImage fetch failed, falling back to url mode:`, err);
+      const sent = await this.sock.sendMessage(jid, { image: { url: imageUrl }, caption: caption || undefined });
+      return { id: sent?.key?.id || "" };
+    }
   }
 
   async sendAudio(
@@ -375,14 +403,25 @@ export class Session {
     if (!this.sock) throw new Error("Session not connected");
     const jid = this.toJid(phone);
 
-    const content = audio.base64
-      ? { audio: Buffer.from(audio.base64, "base64"), mimetype: "audio/ogg; codecs=opus", ptt: true }
-      : audio.url
-        ? { audio: { url: audio.url }, mimetype: "audio/ogg; codecs=opus", ptt: true }
-        : null;
-    if (!content) throw new Error("No audio data provided");
+    // Baileys needs the actual audio bytes (a Buffer), not a remote URL, to
+    // reliably produce a playable voice note with the correct waveform/ptt
+    // flag. Prefer base64 bytes; only fetch the URL as a fallback.
+    let buffer: Buffer;
+    if (audio.base64) {
+      buffer = Buffer.from(audio.base64, "base64");
+    } else if (audio.url) {
+      const res = await fetch(audio.url);
+      if (!res.ok) throw new Error(`Failed to fetch audio_url: ${res.status}`);
+      buffer = Buffer.from(await res.arrayBuffer());
+    } else {
+      throw new Error("No audio data provided");
+    }
 
-    const sent = await this.sock.sendMessage(jid, content as any);
+    const sent = await this.sock.sendMessage(jid, {
+      audio: buffer,
+      mimetype: "audio/ogg; codecs=opus",
+      ptt: true,
+    });
     return { id: sent?.key?.id || "" };
   }
 

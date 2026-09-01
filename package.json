@@ -1,0 +1,31 @@
+{
+  "name": "velo-bridge-baileys",
+  "version": "1.0.0",
+  "description": "Baileys-based WhatsApp bridge for Velo.ai — lightweight WebSocket sessions (no Chromium), QR + phone pairing. Parallel/experimental replacement for velo-bridge (whatsapp-web.js).",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.49.1",
+    "@whiskeysockets/baileys": "6.7.24",
+    "express": "4.21.0",
+    "dotenv": "16.4.7",
+    "pino": "9.6.0",
+    "qrcode": "1.5.4",
+    "ws": "8.18.0"
+  },
+  "devDependencies": {
+    "@types/express": "5.0.0",
+    "@types/node": "22.0.0",
+    "@types/qrcode": "1.5.5",
+    "typescript": "5.5.4",
+    "tsx": "4.19.2"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -178,6 +178,7 @@ export class Session {
     if (connection === "close") {
       const statusCode = (lastDisconnect?.error as Boom | undefined)?.output?.statusCode;
       const loggedOut = statusCode === DisconnectReason.loggedOut;
+      const timedOut = statusCode === DisconnectReason.timedOut || statusCode === 515;
 
       if (loggedOut) {
         this.info.status = "disconnected";
@@ -187,6 +188,22 @@ export class Session {
           fs.rmSync(this.authDir, { recursive: true, force: true });
           fs.mkdirSync(this.authDir, { recursive: true });
         } catch { /* ignore */ }
+        return;
+      }
+
+      // Timeout errors (515) should NOT clear auth - just reconnect
+      if (timedOut) {
+        console.warn(`[session ${this.info.shopId}] connection timed out — reconnecting with existing auth`);
+        this.info.status = "connecting";
+        await this.markConnected(false);
+        
+        if (!this.reconnecting) {
+          this.reconnecting = true;
+          setTimeout(() => {
+            this.reconnecting = false;
+            this.connect().catch((e) => console.error(`[session ${this.info.shopId}] reconnect failed:`, e));
+          }, 5000); // Wait 5 seconds before reconnecting
+        }
         return;
       }
 
@@ -343,6 +360,7 @@ export class Session {
         method: "POST",
         headers: { "Content-Type": "application/json", "x-bridge-secret": bridgeSecret },
         body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(45000), // 45 second timeout to prevent hanging
       });
 
       const data = (await res.json().catch(() => ({}))) as {

@@ -373,30 +373,39 @@ export class Session {
 
       if (!res.ok || !data?.ok) return;
 
+      // Small random delay before starting to send (simulates bot "thinking")
+      await randomDelay(800, 1500);
+
+      // Send images with random delays (typing indicator shown automatically)
       for (const url of (data.images || []).slice(0, 6)) {
         try {
-          await this.sendImage(phone, url);
-          await sleep(1200);
+          await this.sendImage(phone, url); // Typing indicator built-in
+          await randomDelay(1000, 2000); // Random 1-2 seconds between images
         } catch { /* ignore */ }
       }
 
+      // Send audio with random delays (typing indicator shown automatically)
       for (const url of (data.audios || []).slice(0, 2)) {
         try {
-          await this.sendAudio(phone, { url });
-          await sleep(1200);
+          await this.sendAudio(phone, { url }); // Typing indicator built-in
+          await randomDelay(1000, 2000); // Random 1-2 seconds between audio
         } catch { /* ignore */ }
       }
 
+      // Send text bubbles with typing indicators and random delays
       for (const b of data.bubbles || []) {
         if (!b.trim()) continue;
         try {
-          await this.sendText(phone, b);
-          await sleep(900);
+          await this.sendText(phone, b); // Typing indicator built-in (based on message length)
+          await randomDelay(800, 1500); // Random pause between messages
         } catch { /* ignore */ }
       }
 
       if (data.reviews_link) {
-        try { await this.sendText(phone, `⭐ More reviews: ${data.reviews_link}`); } catch { /* ignore */ }
+        try { 
+          await randomDelay(800, 1200); // Small pause before review link
+          await this.sendText(phone, `⭐ More reviews: ${data.reviews_link}`); 
+        } catch { /* ignore */ }
       }
     } catch (e) {
       console.error("[triggerBot]", e);
@@ -417,16 +426,51 @@ export class Session {
     return `${digits}@s.whatsapp.net`;
   }
 
-  async sendText(phone: string, message: string): Promise<{ id: string }> {
+  /**
+   * Show typing indicator to customer (makes bot look more human).
+   * Simulates "typing..." bubble in WhatsApp.
+   */
+  private async showTyping(phone: string, durationMs: number = 2000): Promise<void> {
+    if (!this.sock) return;
+    const jid = this.toJid(phone);
+    try {
+      // Start composing (typing indicator)
+      await this.sock.sendPresenceUpdate("composing", jid);
+      
+      // Wait for the typing duration
+      await sleep(durationMs);
+      
+      // Stop composing (remove typing indicator)
+      await this.sock.sendPresenceUpdate("paused", jid);
+    } catch (e) {
+      // Typing indicators are non-critical, ignore errors
+      console.warn(`[session ${this.info.shopId}] typing indicator failed:`, e);
+    }
+  }
+
+  async sendText(phone: string, message: string, showTyping: boolean = true): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
     const jid = this.toJid(phone);
+    
+    // Show typing indicator before sending (simulate human typing)
+    if (showTyping) {
+      const typingDuration = Math.min(Math.max(message.length * 30, 800), 3000);
+      await this.showTyping(phone, typingDuration);
+    }
+    
     const sent = await this.sock.sendMessage(jid, { text: message });
     return { id: sent?.key?.id || "" };
   }
 
-  async sendImage(phone: string, imageUrl: string, caption?: string): Promise<{ id: string }> {
+  async sendImage(phone: string, imageUrl: string, caption?: string, showTyping: boolean = true): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
     const jid = this.toJid(phone);
+    
+    // Show typing indicator before sending image
+    if (showTyping) {
+      await this.showTyping(phone, 1500); // 1.5 seconds typing for images
+    }
+    
     try {
       // Fetch the bytes ourselves — more reliable than letting Baileys fetch a
       // remote URL, which can fail silently on redirects/slow responses.
@@ -445,9 +489,15 @@ export class Session {
   async sendAudio(
     phone: string,
     audio: { url?: string; base64?: string; mimetype?: string },
+    showTyping: boolean = true,
   ): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
     const jid = this.toJid(phone);
+
+    // Show typing indicator before sending audio
+    if (showTyping) {
+      await this.showTyping(phone, 1500); // 1.5 seconds typing for audio
+    }
 
     // Baileys needs the actual audio bytes (a Buffer), not a remote URL, to
     // reliably produce a playable voice note with the correct waveform/ptt
@@ -572,4 +622,13 @@ export async function restoreSessions(): Promise<void> {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Random delay to mimic human typing behavior and avoid WhatsApp ban detection.
+ * Adds randomness to make message timing look more natural.
+ */
+function randomDelay(min: number, max: number): Promise<void> {
+  const ms = Math.floor(Math.random() * (max - min + 1)) + min;
+  return sleep(ms);
 }

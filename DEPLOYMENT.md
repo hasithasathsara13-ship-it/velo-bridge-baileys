@@ -1,5 +1,20 @@
 # 🚀 Deployment Guide (Zero-Downtime + Session Preservation)
 
+# SSH into server
+ssh ubuntu@your-server
+
+# Navigate and deploy
+cd /home/ubuntu/velo-bridge-baileys
+git pull origin main
+npm run build
+pm2 reload velo-bridge-baileys
+
+
+
+
+
+
+
 ## 📋 Overview
 
 This guide ensures **100+ businesses stay connected** through code updates without rescanning QR codes.

@@ -349,6 +349,7 @@ export class Session {
         ok?: boolean;
         bubbles?: string[];
         images?: string[];
+        audios?: string[];
         reviews_link?: string;
       };
 
@@ -357,6 +358,13 @@ export class Session {
       for (const url of (data.images || []).slice(0, 6)) {
         try {
           await this.sendImage(phone, url);
+          await sleep(1200);
+        } catch { /* ignore */ }
+      }
+
+      for (const url of (data.audios || []).slice(0, 2)) {
+        try {
+          await this.sendAudio(phone, { url });
           await sleep(1200);
         } catch { /* ignore */ }
       }

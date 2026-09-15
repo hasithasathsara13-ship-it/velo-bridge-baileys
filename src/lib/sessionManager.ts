@@ -674,6 +674,20 @@ export class Session {
     } catch { /* ignore */ }
   }
 
+  /** Close the local socket WITHOUT telling WhatsApp's servers to invalidate
+   *  the session. Safe to call on process shutdown/restart — the on-disk
+   *  creds remain valid and the session reconnects automatically next boot,
+   *  with no QR/pairing re-scan required. */
+  async closeSocket(): Promise<void> {
+    try { this.sock?.end(undefined as any); } catch { /* ignore */ }
+    this.info.status = "disconnected";
+    await this.markConnected(false);
+  }
+
+  /** Fully unlink this WhatsApp session: logs out via WhatsApp's servers
+   *  (invalidating the credentials) and closes the local socket. Only call
+   *  this for a genuine user-requested disconnect — after this, the business
+   *  MUST re-scan a QR code / re-enter a pairing code to reconnect. */
   async destroy(): Promise<void> {
     try { await this.sock?.logout(); } catch { /* ignore */ }
     try { this.sock?.end(undefined as any); } catch { /* ignore */ }
@@ -695,7 +709,7 @@ export async function createSession(shopId: string, phoneForPairing?: string): P
   if (existing) {
     const s = existing.getInfo().status;
     if (s === "connected" || s === "qr" || s === "connecting") return existing;
-    await existing.destroy().catch(() => {});
+    await existing.closeSocket().catch(() => {});
     sessions.delete(shopId);
   }
 

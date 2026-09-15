@@ -45,7 +45,7 @@ const shutdown = async () => {
   for (const s of sessions) {
     try {
       const session = getSession(s.shopId);
-      if (session) await session.destroy();
+      if (session) await session.closeSocket();
     } catch { /* ignore */ }
   }
   process.exit(0);

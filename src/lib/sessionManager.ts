@@ -89,6 +89,11 @@ export class Session {
   // Remember the exact jid a phone number last messaged from (handles @lid
   // contacts that can only be reached via their lid jid, not phone@s.whatsapp.net).
   private phoneToChatJid = new Map<string, string>();
+  // Per-chat in-flight bridge-send counter, and resolved ids of bridge-initiated
+  // sends. Distinguishes messages the bridge itself sent (admin-panel sends, bot
+  // replies) from messages the owner typed manually on their paired phone.
+  private pendingBridgeSends = new Map<string, number>();
+  private bridgeSentMessageIds = new Set<string>();
 
   constructor(shopId: string, phoneForPairing?: string) {
     this.info = { shopId, status: "connecting", qrCode: null, pairingCode: null, phoneNumber: null };
@@ -126,6 +131,11 @@ export class Session {
     sock.ev.on("messages.upsert", ({ messages, type }) => {
       if (type !== "notify") return;
       for (const msg of messages) {
+        if (msg.key.fromMe) {
+          if (this.isBridgeInitiated(msg)) continue;
+          this.handleOwnerSentMessage(msg).catch((e) => console.error("[msg-owner]", e));
+          continue;
+        }
         this.handleIncoming(msg).catch((e) => console.error("[msg]", e));
       }
     });
@@ -226,6 +236,40 @@ export class Session {
         }, 3000);
       }
     }
+  }
+
+  // ─── Bridge-send tracking ────────────────────────────────────────────────
+
+  private async trackBridgeSend<T extends { key?: { id?: string | null } } | null | undefined>(
+    jid: string,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    this.pendingBridgeSends.set(jid, (this.pendingBridgeSends.get(jid) || 0) + 1);
+    try {
+      const result = await fn();
+      const id = result?.key?.id || "";
+      if (id) {
+        this.bridgeSentMessageIds.add(id);
+        setTimeout(() => this.bridgeSentMessageIds.delete(id), 15000);
+      }
+      return result;
+    } finally {
+      setTimeout(() => {
+        const cur = this.pendingBridgeSends.get(jid) || 0;
+        if (cur <= 1) this.pendingBridgeSends.delete(jid);
+        else this.pendingBridgeSends.set(jid, cur - 1);
+      }, 2000);
+    }
+  }
+
+  private isBridgeInitiated(msg: WAMessage): boolean {
+    const id = msg.key.id || "";
+    const jid = msg.key.remoteJid || "";
+    if (id && this.bridgeSentMessageIds.has(id)) {
+      this.bridgeSentMessageIds.delete(id);
+      return true;
+    }
+    return (this.pendingBridgeSends.get(jid) || 0) > 0;
   }
 
   // ─── Incoming Message Handler ────────────────────────────────────────────
@@ -340,6 +384,84 @@ export class Session {
     if (textForBot || mediaType) {
       await this.triggerBot(shopId, phone, textForBot, mediaType, mediaUrl).catch((e) => console.error("[bot]", e));
     }
+  }
+
+  // ─── Owner-Sent Message Handler (manual sends from the paired phone) ────
+
+  private async handleOwnerSentMessage(msg: WAMessage): Promise<void> {
+    const jid = msg.key.remoteJid || "";
+    if (!jid || jid === "status@broadcast" || jid.endsWith("@g.us")) return;
+
+    const msgId = msg.key.id || "";
+    if (msgId) {
+      if (this.processedMsgIds.has(msgId)) return;
+      this.processedMsgIds.add(msgId);
+      if (this.processedMsgIds.size > 1000) this.processedMsgIds.clear();
+    }
+
+    const content = normalizeMessageContent(msg.message);
+    if (!content) return;
+
+    const type = Object.keys(content)[0] || "";
+    console.log(`[msg] owner-sent (manual): type=${type}, jid=${jid.slice(0, 20)}`);
+
+    const sb = getSupabase();
+    const shopId = this.info.shopId;
+    const phone = this.resolveRealNumber(msg);
+    if (!phone) return;
+
+    this.phoneToChatJid.set(phone, jid);
+
+    let textContent = "";
+    const isMedia = Boolean(content.imageMessage || content.audioMessage || content.videoMessage || content.documentMessage);
+
+    if (isMedia) {
+      const caption = content.imageMessage?.caption || content.videoMessage?.caption || "";
+      try {
+        const buffer = (await downloadMediaMessage(
+          msg,
+          "buffer",
+          {},
+          { logger, reuploadRequest: this.sock!.updateMediaMessage },
+        )) as Buffer;
+
+        const mime =
+          content.imageMessage?.mimetype ||
+          content.audioMessage?.mimetype ||
+          content.videoMessage?.mimetype ||
+          content.documentMessage?.mimetype ||
+          "";
+
+        const url = await uploadInboundMedia(shopId, buffer, mime);
+        if (url) {
+          textContent = url;
+        }
+      } catch (e: any) {
+        console.warn(`[msg] owner-sent media download failed:`, e?.message || e);
+      }
+      if (!textContent) {
+        textContent = content.audioMessage ? "🎤 Voice message" : "📎 Media";
+      }
+      // caption is currently unused for the persisted row (mirrors handleIncoming,
+      // which stores the media URL as content and only forwards caption to the bot —
+      // owner-sent messages never go to the bot, so caption is intentionally dropped
+      // here rather than silently duplicated into content).
+    } else {
+      textContent = (content.conversation || content.extendedTextMessage?.text || "").trim();
+    }
+
+    if (!textContent) return;
+
+    await sb.from("customers").upsert(
+      { shop_id: shopId, phone_number: phone, bot_active: true },
+      { onConflict: "shop_id,phone_number", ignoreDuplicates: true },
+    );
+
+    const row: Record<string, unknown> = { shop_id: shopId, phone_number: phone, role: "admin", content: textContent };
+    if (msgId) row.wa_message_id = msgId;
+    await sb.from("messages").insert(row);
+    // Deliberately no triggerBot call — an owner's manual message must never
+    // cause an automated bot reply.
   }
 
   // ─── Bot Trigger ─────────────────────────────────────────────────────────
@@ -458,7 +580,7 @@ export class Session {
       await this.showTyping(phone, typingDuration);
     }
     
-    const sent = await this.sock.sendMessage(jid, { text: message });
+    const sent = await this.trackBridgeSend(jid, () => this.sock!.sendMessage(jid, { text: message }));
     return { id: sent?.key?.id || "" };
   }
 
@@ -477,11 +599,15 @@ export class Session {
       const res = await fetch(imageUrl);
       if (!res.ok) throw new Error(`Failed to fetch image_url: ${res.status}`);
       const buffer = Buffer.from(await res.arrayBuffer());
-      const sent = await this.sock.sendMessage(jid, { image: buffer, caption: caption || undefined });
+      const sent = await this.trackBridgeSend(jid, () =>
+        this.sock!.sendMessage(jid, { image: buffer, caption: caption || undefined }),
+      );
       return { id: sent?.key?.id || "" };
     } catch (err) {
       console.error(`[session ${this.info.shopId}] sendImage fetch failed, falling back to url mode:`, err);
-      const sent = await this.sock.sendMessage(jid, { image: { url: imageUrl }, caption: caption || undefined });
+      const sent = await this.trackBridgeSend(jid, () =>
+        this.sock!.sendMessage(jid, { image: { url: imageUrl }, caption: caption || undefined }),
+      );
       return { id: sent?.key?.id || "" };
     }
   }
@@ -513,11 +639,13 @@ export class Session {
       throw new Error("No audio data provided");
     }
 
-    const sent = await this.sock.sendMessage(jid, {
-      audio: buffer,
-      mimetype: "audio/ogg; codecs=opus",
-      ptt: true,
-    });
+    const sent = await this.trackBridgeSend(jid, () =>
+      this.sock!.sendMessage(jid, {
+        audio: buffer,
+        mimetype: "audio/ogg; codecs=opus",
+        ptt: true,
+      }),
+    );
     return { id: sent?.key?.id || "" };
   }
 

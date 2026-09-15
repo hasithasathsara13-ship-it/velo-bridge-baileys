@@ -89,6 +89,11 @@ export class Session {
   // Remember the exact jid a phone number last messaged from (handles @lid
   // contacts that can only be reached via their lid jid, not phone@s.whatsapp.net).
   private phoneToChatJid = new Map<string, string>();
+  // Reverse of phoneToChatJid: exact chat jid -> resolved phone number.
+  // Lets outbound (fromMe) messages to LID-only contacts resolve back to the
+  // real phone number, since Baileys never exposes a recipient's phone
+  // number on an outbound stanza (only the sender's, which is us).
+  private chatJidToPhone = new Map<string, string>();
   // Per-chat in-flight bridge-send counter, and resolved ids of bridge-initiated
   // sends. Distinguishes messages the bridge itself sent (admin-panel sends, bot
   // replies) from messages the owner typed manually on their paired phone.
@@ -285,6 +290,20 @@ export class Session {
     return jid.split("@")[0].replace(/\D/g, "");
   }
 
+  /** Resolves the customer's real phone number for an outbound (fromMe)
+   *  message. Baileys never attaches the recipient's phone number to an
+   *  outbound stanza (only the sender's), so for LID-only contacts the only
+   *  reliable source is the reverse map built from that contact's prior
+   *  inbound messages. Falls back to resolveRealNumber's jid-digit parsing
+   *  for ordinary (non-LID) contacts or brand-new conversations we have no
+   *  prior mapping for. */
+  private resolveOwnerCounterpartyNumber(msg: WAMessage): string {
+    const jid = msg.key.remoteJid || "";
+    const remembered = this.chatJidToPhone.get(jid);
+    if (remembered) return remembered;
+    return this.resolveRealNumber(msg);
+  }
+
   private async handleIncoming(msg: WAMessage): Promise<void> {
     const jid = msg.key.remoteJid || "";
     if (!jid || jid === "status@broadcast" || jid.endsWith("@g.us") || msg.key.fromMe) return;
@@ -316,6 +335,7 @@ export class Session {
     // Remember which exact jid this phone number messaged from, so replies
     // (especially to @lid contacts) go back to the correct chat.
     this.phoneToChatJid.set(phone, jid);
+    this.chatJidToPhone.set(jid, phone);
 
     let textContent = "";
     let mediaUrl: string | null = null;
@@ -407,10 +427,11 @@ export class Session {
 
     const sb = getSupabase();
     const shopId = this.info.shopId;
-    const phone = this.resolveRealNumber(msg);
+    const phone = this.resolveOwnerCounterpartyNumber(msg);
     if (!phone) return;
 
     this.phoneToChatJid.set(phone, jid);
+    this.chatJidToPhone.set(jid, phone);
 
     let textContent = "";
     const isMedia = Boolean(content.imageMessage || content.audioMessage || content.videoMessage || content.documentMessage);

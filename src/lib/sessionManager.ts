@@ -53,6 +53,13 @@ function extForMime(mime: string): string {
   return "bin";
 }
 
+/** Extract just the digits of a jid's user part, dropping any device suffix
+ *  (`user:12@server`) and the server domain. Used as a stable map key so the
+ *  same contact matches whether addressed via @lid or @s.whatsapp.net. */
+function jidUserDigits(jid: string | null | undefined): string {
+  return String(jid || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+}
+
 async function uploadInboundMedia(shopId: string, buffer: Buffer, mime: string): Promise<string | null> {
   try {
     const sb = getSupabase();
@@ -89,11 +96,17 @@ export class Session {
   // Remember the exact jid a phone number last messaged from (handles @lid
   // contacts that can only be reached via their lid jid, not phone@s.whatsapp.net).
   private phoneToChatJid = new Map<string, string>();
-  // Reverse of phoneToChatJid: exact chat jid -> resolved phone number.
-  // Lets outbound (fromMe) messages to LID-only contacts resolve back to the
-  // real phone number, since Baileys never exposes a recipient's phone
-  // number on an outbound stanza (only the sender's, which is us).
-  private chatJidToPhone = new Map<string, string>();
+  // Maps a contact's LID digits -> their real phone number. Needed because
+  // WhatsApp only ever exposes a *sender's* phone number, never a recipient's:
+  // for an owner-sent (fromMe) message to a privacy-mode contact, the only
+  // addressing we get is the contact's @lid jid. Persisted to disk so it
+  // survives restarts.
+  private lidToPhone = new Map<string, string>();
+  private lidMapPath: string;
+  private lidMapDirty = false;
+  // Reverse index of lidToPhone's values — lets resolveLidViaUsync skip phones
+  // whose LID we already know instead of re-querying them on every miss.
+  private mappedPhones = new Set<string>();
   // Per-chat in-flight bridge-send counter, and resolved ids of bridge-initiated
   // sends. Distinguishes messages the bridge itself sent (admin-panel sends, bot
   // replies) from messages the owner typed manually on their paired phone.
@@ -104,7 +117,50 @@ export class Session {
     this.info = { shopId, status: "connecting", qrCode: null, pairingCode: null, phoneNumber: null };
     this.pairingPhone = phoneForPairing?.replace(/[^\d]/g, "") || null;
     this.authDir = path.join(SESSIONS_DIR, shopId);
+    this.lidMapPath = path.join(this.authDir, "lid-map.json");
     if (!fs.existsSync(this.authDir)) fs.mkdirSync(this.authDir, { recursive: true });
+  }
+
+  // ─── LID ↔ phone map (persisted) ─────────────────────────────────────────
+
+  private loadLidMap(): void {
+    try {
+      if (!fs.existsSync(this.lidMapPath)) return;
+      const raw = JSON.parse(fs.readFileSync(this.lidMapPath, "utf8")) as Record<string, string>;
+      for (const [lid, phone] of Object.entries(raw)) {
+        if (lid && phone) {
+          this.lidToPhone.set(lid, phone);
+          this.mappedPhones.add(phone);
+        }
+      }
+      console.log(`[session ${this.info.shopId}] loaded ${this.lidToPhone.size} lid->phone mappings`);
+    } catch (e: any) {
+      console.warn(`[session ${this.info.shopId}] failed to load lid map:`, e?.message || e);
+    }
+  }
+
+  private saveLidMap(): void {
+    if (!this.lidMapDirty) return;
+    this.lidMapDirty = false;
+    try {
+      const obj: Record<string, string> = {};
+      for (const [lid, phone] of this.lidToPhone) obj[lid] = phone;
+      fs.writeFileSync(this.lidMapPath, JSON.stringify(obj), "utf8");
+    } catch (e: any) {
+      console.warn(`[session ${this.info.shopId}] failed to save lid map:`, e?.message || e);
+    }
+  }
+
+  /** Record a lid<->phone association from any source. */
+  private rememberLid(lidJidOrDigits: string | null | undefined, phone: string): void {
+    const lid = jidUserDigits(lidJidOrDigits);
+    const ph = String(phone || "").replace(/\D/g, "");
+    if (!lid || !ph || lid === ph) return;
+    if (this.lidToPhone.get(lid) === ph) return;
+    this.lidToPhone.set(lid, ph);
+    this.mappedPhones.add(ph);
+    this.lidMapDirty = true;
+    this.saveLidMap();
   }
 
   getInfo(): SessionInfo {
@@ -114,6 +170,9 @@ export class Session {
   // ─── Connection lifecycle ────────────────────────────────────────────────
 
   async connect(): Promise<void> {
+    // connect() is re-entered on every reconnect — only read from disk once.
+    if (this.lidToPhone.size === 0) this.loadLidMap();
+
     const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
     this.saveCreds = saveCreds;
     const { version } = await fetchLatestBaileysVersion();
@@ -143,6 +202,25 @@ export class Session {
         }
         this.handleIncoming(msg).catch((e) => console.error("[msg]", e));
       }
+    });
+
+    // Contact syncs are the richest source of lid<->phone pairs: Baileys'
+    // Contact carries both `lid` and `jid` for privacy-mode contacts.
+    const onContacts = (contacts: Array<{ id?: string; lid?: string; jid?: string }>) => {
+      for (const c of contacts || []) {
+        const phoneJid = c.jid || (c.id && !c.id.includes("@lid") ? c.id : "");
+        const lidJid = c.lid || (c.id && c.id.includes("@lid") ? c.id : "");
+        const phone = jidUserDigits(phoneJid);
+        if (lidJid && phone) this.rememberLid(lidJid, phone);
+      }
+    };
+    sock.ev.on("contacts.upsert", onContacts);
+    sock.ev.on("contacts.update", onContacts as any);
+
+    // Emitted when a contact shares their phone number for a LID chat.
+    sock.ev.on("chats.phoneNumberShare" as any, (update: { lid?: string; jid?: string }) => {
+      const phone = jidUserDigits(update?.jid);
+      if (update?.lid && phone) this.rememberLid(update.lid, phone);
     });
 
     // Phone pairing: request the code once creds are not yet registered.
@@ -290,18 +368,70 @@ export class Session {
     return jid.split("@")[0].replace(/\D/g, "");
   }
 
-  /** Resolves the customer's real phone number for an outbound (fromMe)
-   *  message. Baileys never attaches the recipient's phone number to an
-   *  outbound stanza (only the sender's), so for LID-only contacts the only
-   *  reliable source is the reverse map built from that contact's prior
-   *  inbound messages. Falls back to resolveRealNumber's jid-digit parsing
-   *  for ordinary (non-LID) contacts or brand-new conversations we have no
-   *  prior mapping for. */
-  private resolveOwnerCounterpartyNumber(msg: WAMessage): string {
+  /** Resolve the customer's real phone number for an owner-sent (fromMe)
+   *  message. WhatsApp never attaches a recipient's phone number to an
+   *  outbound stanza, so for privacy-mode contacts the jid is a @lid and we
+   *  must map it back ourselves. */
+  private async resolveOwnerCounterpartyNumber(msg: WAMessage): Promise<string> {
     const jid = msg.key.remoteJid || "";
-    const remembered = this.chatJidToPhone.get(jid);
-    if (remembered) return remembered;
+
+    // Non-LID chats already carry the real number in the jid.
+    if (!jid.includes("@lid")) return this.resolveRealNumber(msg);
+
+    const lid = jidUserDigits(jid);
+
+    // 1. Known mapping (from prior inbound messages / contacts / disk).
+    const known = this.lidToPhone.get(lid);
+    if (known) return known;
+
+    // 2. Ask WhatsApp: usync returns { jid, exists, lid } per phone, so we can
+    //    reverse-match this LID against the phone numbers we already know for
+    //    this shop. Self-healing after a restart with an empty/partial map.
+    const resolved = await this.resolveLidViaUsync(lid).catch(() => "");
+    if (resolved) return resolved;
+
+    console.warn(`[session ${this.info.shopId}] could not map lid ${lid} to a phone number; falling back to lid digits`);
     return this.resolveRealNumber(msg);
+  }
+
+  /** Look up this shop's known customer numbers via usync and find which one
+   *  owns the given LID. Caches every mapping it learns. */
+  private async resolveLidViaUsync(lid: string): Promise<string> {
+    if (!this.sock) return "";
+    try {
+      const sb = getSupabase();
+      const { data } = await sb
+        .from("customers")
+        .select("phone_number")
+        .eq("shop_id", this.info.shopId)
+        .order("created_at", { ascending: false })
+        .limit(200);
+
+      const phones = (data || [])
+        .map((r) => String((r as { phone_number?: string }).phone_number || "").replace(/\D/g, ""))
+        .filter((p) => p.length >= 6 && !this.mappedPhones.has(p));
+      if (phones.length === 0) return "";
+
+      // Query in modest batches so one huge usync call can't stall the socket.
+      for (let i = 0; i < phones.length; i += 25) {
+        const batch = phones.slice(i, i + 25);
+        const results = (await (this.sock as any).onWhatsApp(
+          ...batch.map((p) => `${p}@s.whatsapp.net`),
+        )) as Array<{ jid?: string; lid?: string; exists?: boolean }> | undefined;
+
+        for (const r of results || []) {
+          const phone = jidUserDigits(r?.jid);
+          const rLid = jidUserDigits(r?.lid);
+          if (rLid && phone) this.rememberLid(rLid, phone);
+        }
+
+        const hit = this.lidToPhone.get(lid);
+        if (hit) return hit;
+      }
+    } catch (e: any) {
+      console.warn(`[session ${this.info.shopId}] usync lid lookup failed:`, e?.message || e);
+    }
+    return "";
   }
 
   private async handleIncoming(msg: WAMessage): Promise<void> {
@@ -335,7 +465,11 @@ export class Session {
     // Remember which exact jid this phone number messaged from, so replies
     // (especially to @lid contacts) go back to the correct chat.
     this.phoneToChatJid.set(phone, jid);
-    this.chatJidToPhone.set(jid, phone);
+    // Record every LID form WhatsApp gave us for this contact so a later
+    // owner-sent (fromMe) message addressed via @lid resolves back to this phone.
+    this.rememberLid(msg.key.senderLid, phone);
+    this.rememberLid(msg.key.participantLid, phone);
+    if (jid.includes("@lid")) this.rememberLid(jid, phone);
 
     let textContent = "";
     let mediaUrl: string | null = null;
@@ -424,14 +558,15 @@ export class Session {
 
     const type = Object.keys(content)[0] || "";
     console.log(`[msg] owner-sent (manual): type=${type}, jid=${jid.slice(0, 20)}`);
+    console.log(`[msg] owner-sent key: remoteJid=${jid}, senderLid=${msg.key.senderLid || "-"}, senderPn=${msg.key.senderPn || "-"}, participantLid=${msg.key.participantLid || "-"}, participantPn=${msg.key.participantPn || "-"}`);
 
     const sb = getSupabase();
     const shopId = this.info.shopId;
-    const phone = this.resolveOwnerCounterpartyNumber(msg);
+    const phone = await this.resolveOwnerCounterpartyNumber(msg);
     if (!phone) return;
 
     this.phoneToChatJid.set(phone, jid);
-    this.chatJidToPhone.set(jid, phone);
+    if (jid.includes("@lid")) this.rememberLid(jid, phone);
 
     let textContent = "";
     const isMedia = Boolean(content.imageMessage || content.audioMessage || content.videoMessage || content.documentMessage);
@@ -700,6 +835,7 @@ export class Session {
    *  creds remain valid and the session reconnects automatically next boot,
    *  with no QR/pairing re-scan required. */
   async closeSocket(): Promise<void> {
+    this.saveLidMap();
     try { this.sock?.end(undefined as any); } catch { /* ignore */ }
     this.info.status = "disconnected";
     await this.markConnected(false);

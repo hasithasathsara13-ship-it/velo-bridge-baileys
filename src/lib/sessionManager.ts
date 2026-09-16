@@ -536,11 +536,54 @@ export class Session {
     // Text sent to the bot: the caption for media, or the plain text body otherwise.
     const textForBot = isMedia && !mediaType ? "" : (caption.trim() || textContent);
     if (textForBot || mediaType) {
-      await this.triggerBot(shopId, phone, textForBot, mediaType, mediaUrl).catch((e) => console.error("[bot]", e));
+      this.scheduleBotTrigger(shopId, phone, textForBot, mediaType, mediaUrl, msgId || null, isMedia);
     }
   }
 
-  // ─── Owner-Sent Message Handler (manual sends from the paired phone) ────
+  // ── Media-burst debounce ────────────────────────────────────────────────
+  // When a customer sends multiple photos at once (WhatsApp album), each photo
+  // arrives as a separate message in rapid succession. Without this, the bot
+  // fires one reply per photo — 10 photos = 10 identical "Got your file" msgs.
+  //
+  // Per-phone debounce timers: when a media message arrives we schedule the
+  // bot call 1.5 s out. If another media message from the same phone arrives
+  // before that fires, we cancel the old timer and schedule a fresh one. Only
+  // the last photo in a burst actually triggers the bot, once the burst settles.
+  //
+  // Text messages bypass this entirely — they fire the bot immediately as
+  // before, so single-message conversations are unaffected.
+  private mediaBotDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  private scheduleBotTrigger(
+    shopId: string,
+    phone: string,
+    text: string,
+    mediaType: "audio" | "image" | "document" | null,
+    mediaUrl: string | null,
+    messageId: string | null,
+    isMedia: boolean,
+  ): void {
+    if (!isMedia) {
+      // Text messages fire immediately — no debounce needed.
+      this.triggerBot(shopId, phone, text, mediaType, mediaUrl, messageId).catch(
+        (e) => console.error("[bot]", e),
+      );
+      return;
+    }
+
+    const key = `${shopId}:${phone}`;
+    const existing = this.mediaBotDebounceTimers.get(key);
+    if (existing) clearTimeout(existing);
+
+    const timer = setTimeout(() => {
+      this.mediaBotDebounceTimers.delete(key);
+      this.triggerBot(shopId, phone, text, mediaType, mediaUrl, messageId).catch(
+        (e) => console.error("[bot]", e),
+      );
+    }, 1500); // 1.5 s window — enough to absorb a WhatsApp album burst
+
+    this.mediaBotDebounceTimers.set(key, timer);
+  }
 
   private async handleOwnerSentMessage(msg: WAMessage): Promise<void> {
     const jid = msg.key.remoteJid || "";
@@ -622,13 +665,16 @@ export class Session {
 
   // ─── Bot Trigger ─────────────────────────────────────────────────────────
 
-  private async triggerBot(shopId: string, phone: string, text: string, mediaType: "audio" | "image" | "document" | null, mediaUrl: string | null): Promise<void> {
+  private async triggerBot(shopId: string, phone: string, text: string, mediaType: "audio" | "image" | "document" | null, mediaUrl: string | null, messageId: string | null = null): Promise<void> {
     const frontendUrl = process.env.FRONTEND_URL?.trim();
     const bridgeSecret = process.env.BRIDGE_SECRET?.trim() || "";
     if (!frontendUrl) return;
 
     try {
       const payload: Record<string, string> = { shop_id: shopId, phone_number: phone, text };
+      // Pass the WhatsApp message id so /api/wa-web-bot can deduplicate retried
+      // or duplicate deliveries of the same message (idempotency guard).
+      if (messageId) payload.message_id = messageId;
       if (mediaType && mediaUrl) {
         payload.media_type = mediaType;
         payload.media_url = mediaUrl;

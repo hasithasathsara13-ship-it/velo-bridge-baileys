@@ -478,111 +478,174 @@ export class Session {
 
     const isMedia = Boolean(content.imageMessage || content.audioMessage || content.videoMessage || content.documentMessage);
 
-    if (isMedia) {
-      caption = content.imageMessage?.caption || content.videoMessage?.caption || "";
-      try {
-        const buffer = (await downloadMediaMessage(
-          msg,
-          "buffer",
-          {},
-          { logger, reuploadRequest: this.sock!.updateMediaMessage },
-        )) as Buffer;
+    // Count this photo/file before download. Album items are handled in
+    // parallel; if we only debounce after upload, 10 photos finish seconds
+    // apart and still produce 10 bot replies.
+    if (isMedia) this.beginMediaBotBurst(shopId, phone);
 
-        const mime =
-          content.imageMessage?.mimetype ||
-          content.audioMessage?.mimetype ||
-          content.videoMessage?.mimetype ||
-          content.documentMessage?.mimetype ||
-          "";
+    try {
+      if (isMedia) {
+        caption = content.imageMessage?.caption || content.videoMessage?.caption || "";
+        try {
+          const buffer = (await downloadMediaMessage(
+            msg,
+            "buffer",
+            {},
+            { logger, reuploadRequest: this.sock!.updateMediaMessage },
+          )) as Buffer;
 
-        const url = await uploadInboundMedia(shopId, buffer, mime);
-        if (url) {
-          mediaUrl = url;
-          textContent = url;
-          if (content.audioMessage || mime.includes("audio") || mime.includes("ogg") || mime.includes("opus")) {
-            mediaType = "audio";
-          } else if (content.imageMessage || mime.startsWith("image/")) {
-            mediaType = "image";
-          } else if (mime === "application/pdf" || content.documentMessage) {
-            // Bank receipts and invoices are usually PDFs — pass them to the
-            // bot so it can read and verify them (Gemini handles PDF natively).
-            mediaType = "document";
+          const mime =
+            content.imageMessage?.mimetype ||
+            content.audioMessage?.mimetype ||
+            content.videoMessage?.mimetype ||
+            content.documentMessage?.mimetype ||
+            "";
+
+          const url = await uploadInboundMedia(shopId, buffer, mime);
+          if (url) {
+            mediaUrl = url;
+            textContent = url;
+            if (content.audioMessage || mime.includes("audio") || mime.includes("ogg") || mime.includes("opus")) {
+              mediaType = "audio";
+            } else if (content.imageMessage || mime.startsWith("image/")) {
+              mediaType = "image";
+            } else if (mime === "application/pdf" || content.documentMessage) {
+              // Bank receipts and invoices are usually PDFs — pass them to the
+              // bot so it can read and verify them (Gemini handles PDF natively).
+              mediaType = "document";
+            }
+            console.log(`[msg] media uploaded: type=${mediaType}, mime=${mime}, url=${url.slice(0, 80)}`);
+          } else {
+            console.warn(`[msg] media upload returned no URL — mime=${mime}`);
           }
-          console.log(`[msg] media uploaded: type=${mediaType}, mime=${mime}, url=${url.slice(0, 80)}`);
-        } else {
-          console.warn(`[msg] media upload returned no URL — mime=${mime}`);
+        } catch (e: any) {
+          console.warn(`[msg] media download failed:`, e?.message || e);
         }
-      } catch (e: any) {
-        console.warn(`[msg] media download failed:`, e?.message || e);
+        if (!textContent) {
+          textContent = content.audioMessage ? "🎤 Voice message" : "📎 Media";
+        }
+      } else {
+        textContent = (content.conversation || content.extendedTextMessage?.text || "").trim();
       }
-      if (!textContent) {
-        textContent = content.audioMessage ? "🎤 Voice message" : "📎 Media";
+
+      if (!textContent) return;
+
+      await sb.from("customers").upsert(
+        { shop_id: shopId, phone_number: phone, bot_active: true },
+        { onConflict: "shop_id,phone_number", ignoreDuplicates: true },
+      );
+
+      const row: Record<string, unknown> = { shop_id: shopId, phone_number: phone, role: "user", content: textContent };
+      if (msgId) row.wa_message_id = msgId;
+      await sb.from("messages").insert(row);
+
+      // Text sent to the bot: the caption for media, or the plain text body otherwise.
+      const textForBot = isMedia && !mediaType ? "" : (caption.trim() || textContent);
+      if (isMedia) {
+        this.queueMediaBotBurst(shopId, phone, {
+          text: textForBot,
+          mediaType,
+          mediaUrl,
+          messageId: msgId || null,
+        });
+      } else if (textForBot || mediaType) {
+        this.triggerBot(shopId, phone, textForBot, mediaType, mediaUrl, msgId || null).catch(
+          (e) => console.error("[bot]", e),
+        );
       }
-    } else {
-      textContent = (content.conversation || content.extendedTextMessage?.text || "").trim();
-    }
-
-    if (!textContent) return;
-
-    await sb.from("customers").upsert(
-      { shop_id: shopId, phone_number: phone, bot_active: true },
-      { onConflict: "shop_id,phone_number", ignoreDuplicates: true },
-    );
-
-    const row: Record<string, unknown> = { shop_id: shopId, phone_number: phone, role: "user", content: textContent };
-    if (msgId) row.wa_message_id = msgId;
-    await sb.from("messages").insert(row);
-
-    // Text sent to the bot: the caption for media, or the plain text body otherwise.
-    const textForBot = isMedia && !mediaType ? "" : (caption.trim() || textContent);
-    if (textForBot || mediaType) {
-      this.scheduleBotTrigger(shopId, phone, textForBot, mediaType, mediaUrl, msgId || null, isMedia);
+    } finally {
+      if (isMedia) this.endMediaBotBurst(shopId, phone);
     }
   }
 
-  // ── Media-burst debounce ────────────────────────────────────────────────
-  // When a customer sends multiple photos at once (WhatsApp album), each photo
-  // arrives as a separate message in rapid succession. Without this, the bot
-  // fires one reply per photo — 10 photos = 10 identical "Got your file" msgs.
-  //
-  // Per-phone debounce timers: when a media message arrives we schedule the
-  // bot call 1.5 s out. If another media message from the same phone arrives
-  // before that fires, we cancel the old timer and schedule a fresh one. Only
-  // the last photo in a burst actually triggers the bot, once the burst settles.
-  //
-  // Text messages bypass this entirely — they fire the bot immediately as
-  // before, so single-message conversations are unaffected.
-  private mediaBotDebounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // ── Media-burst coalesce ────────────────────────────────────────────────
+  // WhatsApp albums arrive as many messages, each downloaded in parallel.
+  // Wait until every in-flight download for this customer has finished and
+  // the chat has been quiet for MEDIA_BOT_BURST_MS, then call the bot once
+  // (last photo in the burst). Text messages still fire immediately.
+  private static readonly MEDIA_BOT_BURST_MS = 2500;
 
-  private scheduleBotTrigger(
+  private mediaBotBursts = new Map<string, {
+    timer: ReturnType<typeof setTimeout> | null;
+    inFlight: number;
+    shopId: string;
+    phone: string;
+    pending: {
+      text: string;
+      mediaType: "audio" | "image" | "document" | null;
+      mediaUrl: string | null;
+      messageId: string | null;
+    } | null;
+  }>();
+
+  private mediaBurstKey(shopId: string, phone: string): string {
+    return `${shopId}:${phone}`;
+  }
+
+  private beginMediaBotBurst(shopId: string, phone: string): void {
+    const key = this.mediaBurstKey(shopId, phone);
+    const burst = this.mediaBotBursts.get(key) ?? {
+      timer: null,
+      inFlight: 0,
+      shopId,
+      phone,
+      pending: null,
+    };
+    burst.inFlight += 1;
+    if (burst.timer) {
+      clearTimeout(burst.timer);
+      burst.timer = null;
+    }
+    this.mediaBotBursts.set(key, burst);
+  }
+
+  private queueMediaBotBurst(
     shopId: string,
     phone: string,
-    text: string,
-    mediaType: "audio" | "image" | "document" | null,
-    mediaUrl: string | null,
-    messageId: string | null,
-    isMedia: boolean,
+    pending: {
+      text: string;
+      mediaType: "audio" | "image" | "document" | null;
+      mediaUrl: string | null;
+      messageId: string | null;
+    },
   ): void {
-    if (!isMedia) {
-      // Text messages fire immediately — no debounce needed.
-      this.triggerBot(shopId, phone, text, mediaType, mediaUrl, messageId).catch(
-        (e) => console.error("[bot]", e),
-      );
-      return;
-    }
+    const burst = this.mediaBotBursts.get(this.mediaBurstKey(shopId, phone));
+    if (!burst) return;
+    if (pending.text || pending.mediaType) burst.pending = pending;
+  }
 
-    const key = `${shopId}:${phone}`;
-    const existing = this.mediaBotDebounceTimers.get(key);
-    if (existing) clearTimeout(existing);
+  private endMediaBotBurst(shopId: string, phone: string): void {
+    const key = this.mediaBurstKey(shopId, phone);
+    const burst = this.mediaBotBursts.get(key);
+    if (!burst) return;
+    burst.inFlight = Math.max(0, burst.inFlight - 1);
+    if (burst.inFlight === 0) this.armMediaBotBurst(key);
+  }
 
-    const timer = setTimeout(() => {
-      this.mediaBotDebounceTimers.delete(key);
-      this.triggerBot(shopId, phone, text, mediaType, mediaUrl, messageId).catch(
-        (e) => console.error("[bot]", e),
-      );
-    }, 1500); // 1.5 s window — enough to absorb a WhatsApp album burst
-
-    this.mediaBotDebounceTimers.set(key, timer);
+  private armMediaBotBurst(key: string): void {
+    const burst = this.mediaBotBursts.get(key);
+    if (!burst) return;
+    if (burst.timer) clearTimeout(burst.timer);
+    burst.timer = setTimeout(() => {
+      const current = this.mediaBotBursts.get(key);
+      if (!current) return;
+      if (current.inFlight > 0) {
+        this.armMediaBotBurst(key);
+        return;
+      }
+      const pending = current.pending;
+      this.mediaBotBursts.delete(key);
+      if (!pending) return;
+      console.log(`[bot] media burst settled for ${current.phone} — one reply`);
+      this.triggerBot(
+        current.shopId,
+        current.phone,
+        pending.text,
+        pending.mediaType,
+        pending.mediaUrl,
+        pending.messageId,
+      ).catch((e) => console.error("[bot]", e));
+    }, Session.MEDIA_BOT_BURST_MS);
   }
 
   private async handleOwnerSentMessage(msg: WAMessage): Promise<void> {

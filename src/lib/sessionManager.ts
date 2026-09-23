@@ -930,12 +930,13 @@ export class Session {
   private toJid(phone: string): string {
     const digits = phone.replace(/\D/g, "");
     const remembered = this.phoneToChatJid.get(digits);
-    // Only reuse a normal phone chat. Replying to a stored @lid jid made
-    // WhatsApp show typing and then drop the message, including for shops
-    // that were already working.
-    if (remembered && remembered.endsWith("@s.whatsapp.net")) return remembered;
+    // Use the exact chat the customer wrote from. A LID chat must be answered
+    // on @lid. Sending those digits to @s.whatsapp.net still shows the message,
+    // but the phone cannot decrypt it ("Waiting for this message").
+    // Normal shops keep @s.whatsapp.net, which is the jid they actually use.
+    if (remembered) return remembered;
     for (const [lid, mappedPhone] of this.lidToPhone) {
-      if (lid === digits && mappedPhone) return `${mappedPhone}@s.whatsapp.net`;
+      if (mappedPhone === digits || lid === digits) return `${lid}@lid`;
     }
     return `${digits}@s.whatsapp.net`;
   }

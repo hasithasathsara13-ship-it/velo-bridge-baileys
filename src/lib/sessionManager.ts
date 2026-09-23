@@ -561,7 +561,9 @@ export class Session {
     if (!content) return;
 
     const type = Object.keys(content)[0] || "";
-    console.log(`[msg] incoming: type=${type}, from=${jid.slice(0, 20)}`);
+    console.log(
+      `[msg] incoming: type=${type}, jid=${jid}, senderPn=${msg.key.senderPn || "-"}, participantPn=${msg.key.participantPn || "-"}`,
+    );
 
     const sb = getSupabase();
     const shopId = this.info.shopId;
@@ -926,8 +928,11 @@ export class Session {
     for (const [lid, mappedPhone] of this.lidToPhone) {
       if (mappedPhone === digits) return `${lid}@lid`;
     }
-    // Unmapped LID digits must not be sent as a phone jid — WhatsApp drops them.
-    if (digits.length > 15) return `${digits}@lid`;
+    // New WhatsApp accounts store the chat under a 13–15 digit LID, not a
+    // mobile number. Sending that to @s.whatsapp.net is accepted by the socket
+    // and then dropped, so the dashboard shows the reply but the customer
+    // never receives it. Real numbers we use are shorter (Sri Lanka is 11).
+    if (digits.length >= 13) return `${digits}@lid`;
     return `${digits}@s.whatsapp.net`;
   }
 

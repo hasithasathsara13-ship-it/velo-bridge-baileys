@@ -127,6 +127,9 @@ export class Session {
   // replies) from messages the owner typed manually on their paired phone.
   private pendingBridgeSends = new Map<string, number>();
   private bridgeSentMessageIds = new Set<string>();
+  // Recent outbound proto messages so Baileys can satisfy retry requests
+  // (the customer-side "Waiting for this message" placeholder).
+  private outboundProto = new Map<string, NonNullable<WAMessage["message"]>>();
 
   constructor(shopId: string, phoneForPairing?: string) {
     this.info = { shopId, status: "connecting", qrCode: null, pairingCode: null, phoneNumber: null };
@@ -282,6 +285,11 @@ export class Session {
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      maxMsgRetryCount: 5,
+      getMessage: async (key) => {
+        const id = String(key?.id || "");
+        return id ? this.outboundProto.get(id) : undefined;
+      },
     });
     this.sock = sock;
 
@@ -1108,6 +1116,27 @@ export class Session {
     }
   }
 
+  /** LID 1:1 stanzas need addressing_mode + the real phone, or the customer
+   *  phone shows "Waiting for this message" and never decrypts. PN chats omit this. */
+  private lidSendOptions(jid: string, phone: string): { additionalAttributes: Record<string, string> } | undefined {
+    if (!jid.endsWith("@lid")) return undefined;
+    const digits = String(phone || "").replace(/\D/g, "");
+    const pn = isMobileDigits(digits) ? digits : this.lidToPhone.get(digits) || "";
+    const additionalAttributes: Record<string, string> = { addressing_mode: "lid" };
+    if (pn) additionalAttributes.recipient_pn = `${pn}@s.whatsapp.net`;
+    return { additionalAttributes };
+  }
+
+  private cacheOutbound(sent: { key?: { id?: string | null } | null; message?: WAMessage["message"] } | undefined): void {
+    const id = sent?.key?.id;
+    if (!id || !sent?.message) return;
+    this.outboundProto.set(id, sent.message);
+    if (this.outboundProto.size > 400) {
+      const oldest = this.outboundProto.keys().next().value;
+      if (oldest) this.outboundProto.delete(oldest);
+    }
+  }
+
   async sendText(phone: string, message: string, showTyping: boolean = true): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
     const jid = await this.resolveOutboundJid(phone);
@@ -1119,7 +1148,10 @@ export class Session {
     }
     
     console.log(`[send] text to ${jid} (from ${phone})`);
-    const sent = await this.trackBridgeSend(jid, () => this.sock!.sendMessage(jid, { text: message }));
+    const sent = await this.trackBridgeSend(jid, () =>
+      this.sock!.sendMessage(jid, { text: message }, this.lidSendOptions(jid, phone) as any),
+    );
+    this.cacheOutbound(sent);
     return { id: sent?.key?.id || "" };
   }
 
@@ -1139,14 +1171,16 @@ export class Session {
       if (!res.ok) throw new Error(`Failed to fetch image_url: ${res.status}`);
       const buffer = Buffer.from(await res.arrayBuffer());
       const sent = await this.trackBridgeSend(jid, () =>
-        this.sock!.sendMessage(jid, { image: buffer, caption: caption || undefined }),
+        this.sock!.sendMessage(jid, { image: buffer, caption: caption || undefined }, this.lidSendOptions(jid, phone) as any),
       );
+      this.cacheOutbound(sent);
       return { id: sent?.key?.id || "" };
     } catch (err) {
       console.error(`[session ${this.info.shopId}] sendImage fetch failed, falling back to url mode:`, err);
       const sent = await this.trackBridgeSend(jid, () =>
-        this.sock!.sendMessage(jid, { image: { url: imageUrl }, caption: caption || undefined }),
+        this.sock!.sendMessage(jid, { image: { url: imageUrl }, caption: caption || undefined }, this.lidSendOptions(jid, phone) as any),
       );
+      this.cacheOutbound(sent);
       return { id: sent?.key?.id || "" };
     }
   }
@@ -1183,8 +1217,9 @@ export class Session {
         audio: buffer,
         mimetype: "audio/ogg; codecs=opus",
         ptt: true,
-      }),
+      }, this.lidSendOptions(jid, phone) as any),
     );
+    this.cacheOutbound(sent);
     return { id: sent?.key?.id || "" };
   }
 
@@ -1194,7 +1229,7 @@ export class Session {
     await this.sock.sendMessage(jid, {
       text: newText,
       edit: { remoteJid: jid, id: waMessageId, fromMe: true },
-    });
+    }, this.lidSendOptions(jid, phone) as any);
   }
 
   async deleteMessage(waMessageId: string, phone: string): Promise<void> {
@@ -1202,7 +1237,7 @@ export class Session {
     const jid = await this.resolveOutboundJid(phone);
     await this.sock.sendMessage(jid, {
       delete: { remoteJid: jid, id: waMessageId, fromMe: true },
-    });
+    }, this.lidSendOptions(jid, phone) as any);
   }
 
   // ─── Lifecycle ───────────────────────────────────────────────────────────

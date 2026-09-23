@@ -1,7 +1,6 @@
 /**
- * WhatsApp now requires addressing_mode=lid on 1:1 sends to @lid chats.
- * Baileys 6.7.24 sets that for groups only, so new linked numbers accept
- * the send and then drop it. Older phone-number chats are unchanged.
+ * Undo the LID addressing_mode edit. That attribute made WhatsApp show a
+ * typing bubble and then drop the message for every shop.
  */
 import fs from "fs";
 import path from "path";
@@ -18,21 +17,23 @@ const file = path.join(
   "messages-send.js",
 );
 
-const needle = `            else {
-                stanza.attrs.to = destinationJid;
-            }`;
 const patched = `            else {
                 stanza.attrs.to = destinationJid;
                 if (isLid) stanza.attrs.addressing_mode = 'lid';
             }`;
+const original = `            else {
+                stanza.attrs.to = destinationJid;
+            }`;
+
+if (!fs.existsSync(file)) {
+  console.log("[patch-baileys-lid] baileys not installed, skip");
+  process.exit(0);
+}
 
 const src = fs.readFileSync(file, "utf8");
-if (src.includes("if (isLid) stanza.attrs.addressing_mode = 'lid'")) {
-  console.log("[patch-baileys-lid] already applied");
-} else if (!src.includes(needle)) {
-  console.error("[patch-baileys-lid] could not find the send stanza — baileys version changed");
-  process.exit(1);
+if (!src.includes("if (isLid) stanza.attrs.addressing_mode = 'lid'")) {
+  console.log("[patch-baileys-lid] nothing to revert");
 } else {
-  fs.writeFileSync(file, src.replace(needle, patched));
-  console.log("[patch-baileys-lid] applied");
+  fs.writeFileSync(file, src.replace(patched, original));
+  console.log("[patch-baileys-lid] reverted");
 }

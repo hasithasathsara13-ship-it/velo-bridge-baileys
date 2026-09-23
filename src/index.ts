@@ -33,7 +33,7 @@ app.use("/session", sessionRouter);
 app.use("/message", messageRouter);
 
 app.listen(PORT, () => {
-  console.log(`[bridge-baileys] Running on port ${PORT} (lid-reply-v3)`);
+  console.log(`[bridge-baileys] Running on port ${PORT} (lid-reply-v4)`);
   restoreSessions().catch((err) => console.error("[bridge-baileys] restoreSessions failed:", err));
 });
 

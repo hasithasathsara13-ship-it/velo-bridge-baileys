@@ -930,15 +930,13 @@ export class Session {
   private toJid(phone: string): string {
     const digits = phone.replace(/\D/g, "");
     const remembered = this.phoneToChatJid.get(digits);
-    if (remembered) return remembered;
+    // Only reuse a normal phone chat. Replying to a stored @lid jid made
+    // WhatsApp show typing and then drop the message, including for shops
+    // that were already working.
+    if (remembered && remembered.endsWith("@s.whatsapp.net")) return remembered;
     for (const [lid, mappedPhone] of this.lidToPhone) {
-      if (mappedPhone === digits) return `${lid}@lid`;
+      if (lid === digits && mappedPhone) return `${mappedPhone}@s.whatsapp.net`;
     }
-    // New WhatsApp accounts store the chat under a 13–15 digit LID, not a
-    // mobile number. Sending that to @s.whatsapp.net is accepted by the socket
-    // and then dropped, so the dashboard shows the reply but the customer
-    // never receives it. Real numbers we use are shorter (Sri Lanka is 11).
-    if (digits.length >= 13) return `${digits}@lid`;
     return `${digits}@s.whatsapp.net`;
   }
 

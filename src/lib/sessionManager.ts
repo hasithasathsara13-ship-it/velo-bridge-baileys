@@ -194,7 +194,10 @@ export class Session {
     const raw = String(pn || "");
     if (!raw || raw.includes("@lid")) return "";
     const digits = jidUserDigits(raw);
-    if (digits.length < 8 || digits.length > 15) return "";
+    // 14+ digit values are WhatsApp LIDs, not E.164 mobiles. Treating them as
+    // phones made later replies go to number@s.whatsapp.net and show
+    // "Waiting for this message" on the customer's phone.
+    if (digits.length < 8 || digits.length >= 14) return "";
     return digits;
   }
 
@@ -245,9 +248,8 @@ export class Session {
   // ─── Connection lifecycle ────────────────────────────────────────────────
 
   async connect(): Promise<void> {
-    // connect() is re-entered on every reconnect — only read from disk once.
-    if (this.lidToPhone.size === 0) this.loadLidMap();
-    if (this.phoneToChatJid.size === 0) this.loadChatJids();
+    this.loadLidMap();
+    this.loadChatJids();
 
     const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
     this.saveCreds = saveCreds;
@@ -930,24 +932,22 @@ export class Session {
   private toJid(phone: string): string {
     const digits = phone.replace(/\D/g, "");
     const remembered = this.phoneToChatJid.get(digits);
-    // Use the exact chat the customer wrote from. A LID chat must be answered
-    // on @lid. Sending those digits to @s.whatsapp.net still shows the message,
-    // but the phone cannot decrypt it ("Waiting for this message").
-    // Normal shops keep @s.whatsapp.net, which is the jid they actually use.
     if (remembered) return remembered;
     for (const [lid, mappedPhone] of this.lidToPhone) {
       if (mappedPhone === digits || lid === digits) return `${lid}@lid`;
     }
+    // Opaque LID ids (14+ digits) must stay @lid. Sending them as
+    // @s.whatsapp.net is accepted, then the phone cannot decrypt the bytes.
+    if (digits.length >= 14) return `${digits}@lid`;
     return `${digits}@s.whatsapp.net`;
   }
 
-  /**
-   * Show typing indicator to customer (makes bot look more human).
-   * Simulates "typing..." bubble in WhatsApp.
-   */
   private async showTyping(phone: string, durationMs: number = 2000): Promise<void> {
     if (!this.sock) return;
     const jid = this.toJid(phone);
+    // Composing to @lid without creds.me.lid sends from=undefined and can
+    // leave the next real message undecryptable. Skip typing on LID chats.
+    if (jid.endsWith("@lid") && !this.sock.authState?.creds?.me?.lid) return;
     try {
       // Start composing (typing indicator)
       await this.sock.sendPresenceUpdate("composing", jid);

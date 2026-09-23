@@ -201,9 +201,6 @@ export class Session {
     if (!phone || !jid || jid === "status@broadcast" || jid.endsWith("@g.us")) return;
     const existing = this.phoneToChatJid.get(phone);
     if (existing === jid) return;
-    // Never replace a working @lid address with phone@s.whatsapp.net — that is
-    // what produced "Waiting for this message" on newly linked numbers.
-    if (existing?.includes("@lid") && !jid.includes("@lid")) return;
     this.phoneToChatJid.set(phone, jid);
     this.chatJidDirty = true;
     this.saveChatJids();
@@ -626,20 +623,12 @@ export class Session {
     return this.lidToPhone.get(lid) || "";
   }
 
-  /** After connect, map every known real number to its LID and rewrite inbox
-   *  rows that were stored as LID digits. */
+  /** After connect, rewrite inbox rows that were stored as LID digits. Do not
+   *  mass-usync every customer — that switched working PN shops onto LID sends. */
   private async backfillLidMaps(): Promise<void> {
     try {
-      const phones = await this.collectKnownMobilePhones();
-      for (let i = 0; i < phones.length; i += 25) {
-        const batch = phones.slice(i, i + 25);
-        await Promise.all(batch.map((p) => this.lookupPnLid(p)));
-      }
       for (const [lid, phone] of this.lidToPhone) {
         void this.migrateStoredPhone(lid, phone);
-      }
-      if (this.lidToPhone.size) {
-        console.log(`[session ${this.info.shopId}] lid backfill: ${this.lidToPhone.size} mappings`);
       }
     } catch (e: any) {
       console.warn(`[session ${this.info.shopId}] lid backfill failed:`, e?.message || e);
@@ -1056,32 +1045,21 @@ export class Session {
     const digits = phone.replace(/\D/g, "");
     const remembered = this.phoneToChatJid.get(digits);
 
-    // Already talking to this contact on their LID chat — keep that address.
+    // Last inbound address wins. Working shops (Uptux, Glasgow, …) message as
+    // phone@s.whatsapp.net — never force those onto @lid.
     if (remembered?.includes("@lid")) return remembered;
+    if (remembered) return remembered;
 
     if (digits.length >= 14) {
       const mapped = this.lidToPhone.get(digits);
       if (mapped) {
         const mappedJid = this.phoneToChatJid.get(mapped);
-        if (mappedJid?.includes("@lid")) return mappedJid;
-        return `${digits}@lid`;
+        if (mappedJid) return mappedJid;
       }
       return `${digits}@lid`;
     }
 
-    // Known LID for this mobile. Prefer it over a stale phone@s.whatsapp.net
-    // memory — that stale address is why dashboard sends never arrived.
-    for (const [lid, mappedPhone] of this.lidToPhone) {
-      if (mappedPhone === digits) {
-        const lidJid = `${lid}@lid`;
-        this.rememberChatJid(digits, lidJid);
-        return lidJid;
-      }
-    }
-
-    // Discover LID even when we already "remembered" a PN jid (manual add, or
-    // an older send that used @s.whatsapp.net). PN-only chats get no LID back
-    // from usync and keep the phone jid.
+    // Manual "new conversation" with no inbound yet: ask WhatsApp for a LID.
     if (isMobileDigits(digits)) {
       const lidJid = await this.lookupPnLid(digits);
       if (lidJid) {
@@ -1091,7 +1069,6 @@ export class Session {
       }
     }
 
-    if (remembered) return remembered;
     return `${digits}@s.whatsapp.net`;
   }
 

@@ -1054,23 +1054,30 @@ export class Session {
       const mapped = this.lidToPhone.get(digits);
       if (mapped) {
         const mappedJid = this.phoneToChatJid.get(mapped);
-        if (mappedJid) return mappedJid;
+        if (mappedJid?.includes("@lid")) return mappedJid;
         return `${digits}@lid`;
       }
       return `${digits}@lid`;
     }
 
+    // Known LID for this mobile. Prefer it over a stale phone@s.whatsapp.net
+    // memory — that stale address is why dashboard sends never arrived.
     for (const [lid, mappedPhone] of this.lidToPhone) {
       if (mappedPhone === digits) {
-        return this.phoneToChatJid.get(digits) || `${lid}@lid`;
+        const lidJid = `${lid}@lid`;
+        this.rememberChatJid(digits, lidJid);
+        return lidJid;
       }
     }
 
-    // First outbound to a real number (manual "new conversation"): discover LID.
-    if (!remembered && isMobileDigits(digits)) {
+    // Discover LID even when we already "remembered" a PN jid (manual add, or
+    // an older send that used @s.whatsapp.net). PN-only chats get no LID back
+    // from usync and keep the phone jid.
+    if (isMobileDigits(digits)) {
       const lidJid = await this.lookupPnLid(digits);
       if (lidJid) {
         this.rememberChatJid(digits, lidJid);
+        void this.migrateStoredPhone(jidUserDigits(lidJid), digits);
         return lidJid;
       }
     }
@@ -1082,9 +1089,9 @@ export class Session {
   private async showTyping(phone: string, durationMs: number = 2000, jidOverride?: string): Promise<void> {
     if (!this.sock) return;
     const jid = jidOverride || this.toJid(phone);
-    // Composing to @lid without creds.me.lid sends from=undefined and can
-    // leave the next real message undecryptable. Skip typing on LID chats.
-    if (jid.endsWith("@lid") && !this.sock.authState?.creds?.me?.lid) return;
+    // Typing to @lid can leave the following real message undecryptable
+    // ("Waiting for this message"). Skip it for LID chats.
+    if (jid.endsWith("@lid")) return;
     try {
       // Start composing (typing indicator)
       await this.sock.sendPresenceUpdate("composing", jid);

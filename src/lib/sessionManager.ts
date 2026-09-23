@@ -883,7 +883,9 @@ export class Session {
         try {
           await this.sendImage(phone, url); // Typing indicator built-in
           await randomDelay(1000, 2000); // Random 1-2 seconds between images
-        } catch { /* ignore */ }
+        } catch (e) {
+          console.error(`[bot] image send failed for ${phone}:`, e);
+        }
       }
 
       // Send audio with random delays (typing indicator shown automatically)
@@ -891,7 +893,9 @@ export class Session {
         try {
           await this.sendAudio(phone, { url }); // Typing indicator built-in
           await randomDelay(1000, 2000); // Random 1-2 seconds between audio
-        } catch { /* ignore */ }
+        } catch (e) {
+          console.error(`[bot] audio send failed for ${phone}:`, e);
+        }
       }
 
       // Send text bubbles with typing indicators and random delays
@@ -900,7 +904,9 @@ export class Session {
         try {
           await this.sendText(phone, b); // Typing indicator built-in (based on message length)
           await randomDelay(800, 1500); // Random pause between messages
-        } catch { /* ignore */ }
+        } catch (e) {
+          console.error(`[bot] text send failed for ${phone}:`, e);
+        }
       }
 
       if (data.reviews_link) {
@@ -968,6 +974,7 @@ export class Session {
       await this.showTyping(phone, typingDuration);
     }
     
+    console.log(`[send] text to ${jid} (from ${phone})`);
     const sent = await this.trackBridgeSend(jid, () => this.sock!.sendMessage(jid, { text: message }));
     return { id: sent?.key?.id || "" };
   }

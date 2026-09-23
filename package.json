@@ -6,6 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
+    "postinstall": "node scripts/patch-baileys-lid.mjs",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts"
   },

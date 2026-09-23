@@ -543,10 +543,11 @@ export class Session {
         | Array<{ jid?: string; lid?: unknown; exists?: unknown }>
         | undefined;
       const r = results?.[0];
+      const resultJid = r?.jid ? String(r.jid) : "";
       const lidFromField = asLidJid(r?.lid == null ? "" : String(r.lid));
-      const lidFromJid = String(r?.jid || "").includes("@lid") ? asLidJid(String(r.jid)) : "";
+      const lidFromJid = resultJid.includes("@lid") ? asLidJid(resultJid) : "";
       const lidJid = lidFromField || lidFromJid;
-      const phone = this.phoneFromPn(r?.jid) || digits;
+      const phone = this.phoneFromPn(resultJid) || digits;
       if (lidJid && isMobileDigits(phone)) {
         this.rememberLid(lidJid, phone);
         console.log(`[session ${this.info.shopId}] onWhatsApp ${phone} -> ${lidJid}`);

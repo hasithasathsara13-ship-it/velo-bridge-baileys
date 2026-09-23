@@ -96,6 +96,8 @@ export class Session {
   // Remember the exact jid a phone number last messaged from (handles @lid
   // contacts that can only be reached via their lid jid, not phone@s.whatsapp.net).
   private phoneToChatJid = new Map<string, string>();
+  private chatJidPath: string;
+  private chatJidDirty = false;
   // Maps a contact's LID digits -> their real phone number. Needed because
   // WhatsApp only ever exposes a *sender's* phone number, never a recipient's:
   // for an owner-sent (fromMe) message to a privacy-mode contact, the only
@@ -118,6 +120,7 @@ export class Session {
     this.pairingPhone = phoneForPairing?.replace(/[^\d]/g, "") || null;
     this.authDir = path.join(SESSIONS_DIR, shopId);
     this.lidMapPath = path.join(this.authDir, "lid-map.json");
+    this.chatJidPath = path.join(this.authDir, "chat-jids.json");
     if (!fs.existsSync(this.authDir)) fs.mkdirSync(this.authDir, { recursive: true });
   }
 
@@ -151,6 +154,78 @@ export class Session {
     }
   }
 
+  private loadChatJids(): void {
+    try {
+      if (!fs.existsSync(this.chatJidPath)) return;
+      const raw = JSON.parse(fs.readFileSync(this.chatJidPath, "utf8")) as Record<string, string>;
+      for (const [phone, jid] of Object.entries(raw)) {
+        if (phone && jid) this.phoneToChatJid.set(phone, jid);
+      }
+      console.log(`[session ${this.info.shopId}] loaded ${this.phoneToChatJid.size} chat jids`);
+    } catch (e: any) {
+      console.warn(`[session ${this.info.shopId}] failed to load chat jids:`, e?.message || e);
+    }
+  }
+
+  private saveChatJids(): void {
+    if (!this.chatJidDirty) return;
+    this.chatJidDirty = false;
+    try {
+      const obj: Record<string, string> = {};
+      for (const [phone, jid] of this.phoneToChatJid) obj[phone] = jid;
+      fs.writeFileSync(this.chatJidPath, JSON.stringify(obj), "utf8");
+    } catch (e: any) {
+      console.warn(`[session ${this.info.shopId}] failed to save chat jids:`, e?.message || e);
+    }
+  }
+
+  /** Remember the exact chat jid (often @lid) a phone must be replied to. */
+  private rememberChatJid(phoneDigits: string, jid: string): void {
+    const phone = String(phoneDigits || "").replace(/\D/g, "");
+    if (!phone || !jid || jid === "status@broadcast" || jid.endsWith("@g.us")) return;
+    if (this.phoneToChatJid.get(phone) === jid) return;
+    this.phoneToChatJid.set(phone, jid);
+    this.chatJidDirty = true;
+    this.saveChatJids();
+  }
+
+  /** A PN jid's digits, or "" when this is a LID / not a real mobile number. */
+  private phoneFromPn(pn: string | null | undefined): string {
+    const raw = String(pn || "");
+    if (!raw || raw.includes("@lid")) return "";
+    const digits = jidUserDigits(raw);
+    if (digits.length < 8 || digits.length > 15) return "";
+    return digits;
+  }
+
+  /**
+   * If the first messages were stored under a LID (no phone yet) and WhatsApp
+   * later reveals the real number, move that chat onto the real number so the
+   * dashboard and bot don't stay stuck on the LID.
+   */
+  private async migrateStoredPhone(fromDigits: string, toDigits: string): Promise<void> {
+    if (!fromDigits || !toDigits || fromDigits === toDigits) return;
+    try {
+      const sb = getSupabase();
+      const shopId = this.info.shopId;
+      const { data: taken } = await sb
+        .from("customers")
+        .select("phone_number")
+        .eq("shop_id", shopId)
+        .eq("phone_number", toDigits)
+        .maybeSingle();
+      await sb.from("messages").update({ phone_number: toDigits }).eq("shop_id", shopId).eq("phone_number", fromDigits);
+      if (taken) {
+        await sb.from("customers").delete().eq("shop_id", shopId).eq("phone_number", fromDigits);
+      } else {
+        await sb.from("customers").update({ phone_number: toDigits }).eq("shop_id", shopId).eq("phone_number", fromDigits);
+      }
+      console.log(`[session ${shopId}] moved chat ${fromDigits} -> ${toDigits}`);
+    } catch (e: any) {
+      console.warn(`[session ${this.info.shopId}] lid phone migrate failed:`, e?.message || e);
+    }
+  }
+
   /** Record a lid<->phone association from any source. */
   private rememberLid(lidJidOrDigits: string | null | undefined, phone: string): void {
     const lid = jidUserDigits(lidJidOrDigits);
@@ -172,6 +247,7 @@ export class Session {
   async connect(): Promise<void> {
     // connect() is re-entered on every reconnect — only read from disk once.
     if (this.lidToPhone.size === 0) this.loadLidMap();
+    if (this.phoneToChatJid.size === 0) this.loadChatJids();
 
     const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
     this.saveCreds = saveCreds;
@@ -193,8 +269,18 @@ export class Session {
     sock.ev.on("creds.update", saveCreds);
     sock.ev.on("connection.update", (update) => this.onConnectionUpdate(update));
     sock.ev.on("messages.upsert", ({ messages, type }) => {
-      if (type !== "notify") return;
       for (const msg of messages) {
+        // Newly paired numbers often deliver live chats as "append" during the
+        // first sync. Older sessions only see "notify", so they were unaffected.
+        // Accept recent appends; skip the historical backlog so the bot doesn't
+        // reply to old conversations.
+        if (type === "append") {
+          const rawTs = Number(msg.messageTimestamp || 0);
+          const tsMs = rawTs > 1e12 ? rawTs : rawTs * 1000;
+          if (!tsMs || Date.now() - tsMs > 3 * 60 * 1000) continue;
+        } else if (type !== "notify") {
+          continue;
+        }
         if (msg.key.fromMe) {
           if (this.isBridgeInitiated(msg)) continue;
           this.handleOwnerSentMessage(msg).catch((e) => console.error("[msg-owner]", e));
@@ -210,8 +296,12 @@ export class Session {
       for (const c of contacts || []) {
         const phoneJid = c.jid || (c.id && !c.id.includes("@lid") ? c.id : "");
         const lidJid = c.lid || (c.id && c.id.includes("@lid") ? c.id : "");
-        const phone = jidUserDigits(phoneJid);
-        if (lidJid && phone) this.rememberLid(lidJid, phone);
+        const phone = this.phoneFromPn(phoneJid) || (phoneJid && !phoneJid.includes("@lid") ? jidUserDigits(phoneJid) : "");
+        if (lidJid && phone && phone.length <= 15) {
+          this.rememberLid(lidJid, phone);
+          this.rememberChatJid(phone, lidJid.includes("@") ? lidJid : `${jidUserDigits(lidJid)}@lid`);
+          void this.migrateStoredPhone(jidUserDigits(lidJid), phone);
+        }
       }
     };
     sock.ev.on("contacts.upsert", onContacts);
@@ -219,8 +309,15 @@ export class Session {
 
     // Emitted when a contact shares their phone number for a LID chat.
     sock.ev.on("chats.phoneNumberShare" as any, (update: { lid?: string; jid?: string }) => {
-      const phone = jidUserDigits(update?.jid);
-      if (update?.lid && phone) this.rememberLid(update.lid, phone);
+      const phone = this.phoneFromPn(update?.jid) || jidUserDigits(update?.jid);
+      const lid = jidUserDigits(update?.lid);
+      if (update?.lid && phone && phone.length <= 15) {
+        this.rememberLid(update.lid, phone);
+        if (lid) {
+          this.rememberChatJid(phone, String(update.lid).includes("@") ? String(update.lid) : `${lid}@lid`);
+          void this.migrateStoredPhone(lid, phone);
+        }
+      }
     });
 
     // Phone pairing: request the code once creds are not yet registered.
@@ -259,8 +356,13 @@ export class Session {
       this.info.qrCode = null;
       this.info.pairingCode = null;
       try {
-        const jid = this.sock?.user?.id || "";
-        this.info.phoneNumber = jid.split(":")[0].split("@")[0].replace(/\D/g, "") || null;
+        const me = this.sock?.authState?.creds?.me;
+        const id = me?.id || this.sock?.user?.id || "";
+        const phoneJid = me?.jid && !String(me.jid).includes("@lid") ? String(me.jid) : (!id.includes("@lid") ? id : "");
+        this.info.phoneNumber = jidUserDigits(phoneJid) || null;
+        if (!this.info.phoneNumber && id.includes("@lid")) {
+          console.warn(`[session ${this.info.shopId}] connected identity is a LID (${id}); waiting for the phone jid`);
+        }
       } catch {
         this.info.phoneNumber = null;
       }
@@ -359,13 +461,17 @@ export class Session {
 
   private resolveRealNumber(msg: WAMessage): string {
     const jid = msg.key.remoteJid || "";
-    // Privacy-mode contacts show up as <lid>@lid instead of <phone>@s.whatsapp.net.
-    // Baileys attaches the real phone-number jid as senderPn/participantPn on the
-    // message key in that case — prefer it so the dashboard/bot show the actual
-    // number, not the internal LID.
-    const pn = msg.key.senderPn || msg.key.participantPn || "";
-    if (pn) return pn.split("@")[0].replace(/\D/g, "");
-    return jid.split("@")[0].replace(/\D/g, "");
+    // New WhatsApp accounts address 1:1 chats as <lid>@lid. The real mobile
+    // is on senderPn / participantPn when WhatsApp includes it. Older paired
+    // numbers still put the phone in remoteJid, so they never hit this path.
+    const fromPn = this.phoneFromPn(msg.key.senderPn) || this.phoneFromPn(msg.key.participantPn);
+    if (fromPn) return fromPn;
+    if (jid.includes("@lid")) {
+      const known = this.lidToPhone.get(jidUserDigits(jid));
+      if (known) return known;
+    }
+    if (!jid.includes("@lid")) return jidUserDigits(jid);
+    return jidUserDigits(jid);
   }
 
   /** Resolve the customer's real phone number for an owner-sent (fromMe)
@@ -462,9 +568,14 @@ export class Session {
     const phone = this.resolveRealNumber(msg);
     if (!phone) return;
 
+    const lidDigits = jid.includes("@lid") ? jidUserDigits(jid) : "";
     // Remember which exact jid this phone number messaged from, so replies
-    // (especially to @lid contacts) go back to the correct chat.
-    this.phoneToChatJid.set(phone, jid);
+    // (especially to @lid contacts) go back to the correct chat after a restart.
+    this.rememberChatJid(phone, jid);
+    if (lidDigits && phone !== lidDigits) {
+      this.rememberChatJid(lidDigits, jid);
+      void this.migrateStoredPhone(lidDigits, phone);
+    }
     // Record every LID form WhatsApp gave us for this contact so a later
     // owner-sent (fromMe) message addressed via @lid resolves back to this phone.
     this.rememberLid(msg.key.senderLid, phone);
@@ -671,7 +782,9 @@ export class Session {
     const phone = await this.resolveOwnerCounterpartyNumber(msg);
     if (!phone) return;
 
-    this.phoneToChatJid.set(phone, jid);
+    this.rememberChatJid(phone, jid);
+    const lidDigits = jid.includes("@lid") ? jidUserDigits(jid) : "";
+    if (lidDigits && phone !== lidDigits) void this.migrateStoredPhone(lidDigits, phone);
     if (jid.includes("@lid")) this.rememberLid(jid, phone);
 
     let textContent = "";
@@ -810,6 +923,11 @@ export class Session {
     const digits = phone.replace(/\D/g, "");
     const remembered = this.phoneToChatJid.get(digits);
     if (remembered) return remembered;
+    for (const [lid, mappedPhone] of this.lidToPhone) {
+      if (mappedPhone === digits) return `${lid}@lid`;
+    }
+    // Unmapped LID digits must not be sent as a phone jid — WhatsApp drops them.
+    if (digits.length > 15) return `${digits}@lid`;
     return `${digits}@s.whatsapp.net`;
   }
 

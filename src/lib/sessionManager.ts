@@ -60,6 +60,19 @@ function jidUserDigits(jid: string | null | undefined): string {
   return String(jid || "").split("@")[0].split(":")[0].replace(/\D/g, "");
 }
 
+/** E.164 mobiles are 8–13 digits. WhatsApp LIDs are 14+ digits. */
+function isMobileDigits(digits: string): boolean {
+  return digits.length >= 8 && digits.length < 14;
+}
+
+function asLidJid(lid: string | null | undefined): string {
+  const raw = String(lid || "");
+  if (!raw) return "";
+  if (raw.includes("@")) return raw.includes(":") ? `${raw.split(":")[0]}@lid` : raw;
+  const d = raw.replace(/\D/g, "");
+  return d ? `${d}@lid` : "";
+}
+
 async function uploadInboundMedia(shopId: string, buffer: Buffer, mime: string): Promise<string | null> {
   try {
     const sb = getSupabase();
@@ -183,7 +196,11 @@ export class Session {
   private rememberChatJid(phoneDigits: string, jid: string): void {
     const phone = String(phoneDigits || "").replace(/\D/g, "");
     if (!phone || !jid || jid === "status@broadcast" || jid.endsWith("@g.us")) return;
-    if (this.phoneToChatJid.get(phone) === jid) return;
+    const existing = this.phoneToChatJid.get(phone);
+    if (existing === jid) return;
+    // Never replace a working @lid address with phone@s.whatsapp.net — that is
+    // what produced "Waiting for this message" on newly linked numbers.
+    if (existing?.includes("@lid") && !jid.includes("@lid")) return;
     this.phoneToChatJid.set(phone, jid);
     this.chatJidDirty = true;
     this.saveChatJids();
@@ -197,7 +214,7 @@ export class Session {
     // 14+ digit values are WhatsApp LIDs, not E.164 mobiles. Treating them as
     // phones made later replies go to number@s.whatsapp.net and show
     // "Waiting for this message" on the customer's phone.
-    if (digits.length < 8 || digits.length >= 14) return "";
+    if (!isMobileDigits(digits)) return "";
     return digits;
   }
 
@@ -370,6 +387,7 @@ export class Session {
       }
       console.log(`[session ${this.info.shopId}] ready (${this.info.phoneNumber})`);
       await this.markConnected(true);
+      void this.backfillLidMaps();
     }
 
     if (connection === "close") {
@@ -461,18 +479,30 @@ export class Session {
 
   // ─── Incoming Message Handler ────────────────────────────────────────────
 
+  private extractMessagePhone(msg: WAMessage): string {
+    const key = msg.key as WAMessage["key"] & {
+      remoteJidAlt?: string;
+      participantAlt?: string;
+    };
+    return (
+      this.phoneFromPn(key.senderPn) ||
+      this.phoneFromPn(key.participantPn) ||
+      this.phoneFromPn(key.remoteJidAlt) ||
+      this.phoneFromPn(key.participantAlt) ||
+      ""
+    );
+  }
+
   private resolveRealNumber(msg: WAMessage): string {
     const jid = msg.key.remoteJid || "";
     // New WhatsApp accounts address 1:1 chats as <lid>@lid. The real mobile
-    // is on senderPn / participantPn when WhatsApp includes it. Older paired
-    // numbers still put the phone in remoteJid, so they never hit this path.
-    const fromPn = this.phoneFromPn(msg.key.senderPn) || this.phoneFromPn(msg.key.participantPn);
+    // is on senderPn / participantPn (or *Alt) when WhatsApp includes it.
+    const fromPn = this.extractMessagePhone(msg);
     if (fromPn) return fromPn;
     if (jid.includes("@lid")) {
       const known = this.lidToPhone.get(jidUserDigits(jid));
       if (known) return known;
     }
-    if (!jid.includes("@lid")) return jidUserDigits(jid);
     return jidUserDigits(jid);
   }
 
@@ -502,35 +532,80 @@ export class Session {
     return this.resolveRealNumber(msg);
   }
 
+  /** Ask WhatsApp for this phone's LID. Used when the owner starts a chat
+   *  from the dashboard with a real number the session has never seen. */
+  private async lookupPnLid(digits: string): Promise<string> {
+    if (!this.sock || !isMobileDigits(digits)) return "";
+    const knownLid = [...this.lidToPhone.entries()].find(([, ph]) => ph === digits)?.[0];
+    if (knownLid) return `${knownLid}@lid`;
+    try {
+      const results = (await this.sock.onWhatsApp(`${digits}@s.whatsapp.net`)) as
+        | Array<{ jid?: string; lid?: unknown; exists?: unknown }>
+        | undefined;
+      const r = results?.[0];
+      const lidFromField = asLidJid(r?.lid == null ? "" : String(r.lid));
+      const lidFromJid = String(r?.jid || "").includes("@lid") ? asLidJid(String(r.jid)) : "";
+      const lidJid = lidFromField || lidFromJid;
+      const phone = this.phoneFromPn(r?.jid) || digits;
+      if (lidJid && isMobileDigits(phone)) {
+        this.rememberLid(lidJid, phone);
+        console.log(`[session ${this.info.shopId}] onWhatsApp ${phone} -> ${lidJid}`);
+        return lidJid;
+      }
+    } catch (e: any) {
+      console.warn(`[session ${this.info.shopId}] onWhatsApp ${digits} failed:`, e?.message || e);
+    }
+    return "";
+  }
+
+  private async collectKnownMobilePhones(): Promise<string[]> {
+    const found = new Set<string>();
+    for (const phone of this.phoneToChatJid.keys()) {
+      if (isMobileDigits(phone)) found.add(phone);
+    }
+    for (const phone of this.mappedPhones) {
+      if (isMobileDigits(phone)) found.add(phone);
+    }
+    try {
+      const sb = getSupabase();
+      const shopId = this.info.shopId;
+      const [{ data: customers }, { data: msgs }] = await Promise.all([
+        sb.from("customers").select("phone_number").eq("shop_id", shopId).limit(400),
+        sb.from("messages").select("phone_number").eq("shop_id", shopId).order("created_at", { ascending: false }).limit(800),
+      ]);
+      for (const row of [...(customers || []), ...(msgs || [])]) {
+        const p = String((row as { phone_number?: string }).phone_number || "").replace(/\D/g, "");
+        if (isMobileDigits(p)) found.add(p);
+      }
+    } catch (e: any) {
+      console.warn(`[session ${this.info.shopId}] collect phones failed:`, e?.message || e);
+    }
+    return [...found];
+  }
+
   /** Look up this shop's known customer numbers via usync and find which one
    *  owns the given LID. Caches every mapping it learns. */
   private async resolveLidViaUsync(lid: string): Promise<string> {
+    const cached = this.lidToPhone.get(lid);
+    if (cached) return cached;
     if (!this.sock) return "";
     try {
-      const sb = getSupabase();
-      const { data } = await sb
-        .from("customers")
-        .select("phone_number")
-        .eq("shop_id", this.info.shopId)
-        .order("created_at", { ascending: false })
-        .limit(200);
+      const phones = (await this.collectKnownMobilePhones()).filter((p) => !this.mappedPhones.has(p));
+      if (phones.length === 0) return this.lidToPhone.get(lid) || "";
 
-      const phones = (data || [])
-        .map((r) => String((r as { phone_number?: string }).phone_number || "").replace(/\D/g, ""))
-        .filter((p) => p.length >= 6 && !this.mappedPhones.has(p));
-      if (phones.length === 0) return "";
-
-      // Query in modest batches so one huge usync call can't stall the socket.
       for (let i = 0; i < phones.length; i += 25) {
         const batch = phones.slice(i, i + 25);
-        const results = (await (this.sock as any).onWhatsApp(
+        const results = (await this.sock.onWhatsApp(
           ...batch.map((p) => `${p}@s.whatsapp.net`),
-        )) as Array<{ jid?: string; lid?: string; exists?: boolean }> | undefined;
+        )) as Array<{ jid?: string; lid?: unknown; exists?: unknown }> | undefined;
 
         for (const r of results || []) {
-          const phone = jidUserDigits(r?.jid);
-          const rLid = jidUserDigits(r?.lid);
-          if (rLid && phone) this.rememberLid(rLid, phone);
+          const phone = this.phoneFromPn(r?.jid) || jidUserDigits(r?.jid);
+          const lidJid = asLidJid(r?.lid == null ? "" : String(r.lid));
+          if (lidJid && isMobileDigits(phone)) {
+            this.rememberLid(lidJid, phone);
+            void this.migrateStoredPhone(jidUserDigits(lidJid), phone);
+          }
         }
 
         const hit = this.lidToPhone.get(lid);
@@ -539,7 +614,27 @@ export class Session {
     } catch (e: any) {
       console.warn(`[session ${this.info.shopId}] usync lid lookup failed:`, e?.message || e);
     }
-    return "";
+    return this.lidToPhone.get(lid) || "";
+  }
+
+  /** After connect, map every known real number to its LID and rewrite inbox
+   *  rows that were stored as LID digits. */
+  private async backfillLidMaps(): Promise<void> {
+    try {
+      const phones = await this.collectKnownMobilePhones();
+      for (let i = 0; i < phones.length; i += 25) {
+        const batch = phones.slice(i, i + 25);
+        await Promise.all(batch.map((p) => this.lookupPnLid(p)));
+      }
+      for (const [lid, phone] of this.lidToPhone) {
+        void this.migrateStoredPhone(lid, phone);
+      }
+      if (this.lidToPhone.size) {
+        console.log(`[session ${this.info.shopId}] lid backfill: ${this.lidToPhone.size} mappings`);
+      }
+    } catch (e: any) {
+      console.warn(`[session ${this.info.shopId}] lid backfill failed:`, e?.message || e);
+    }
   }
 
   private async handleIncoming(msg: WAMessage): Promise<void> {
@@ -563,16 +658,20 @@ export class Session {
     if (!content) return;
 
     const type = Object.keys(content)[0] || "";
+    const extraPn = this.extractMessagePhone(msg);
     console.log(
-      `[msg] incoming: type=${type}, jid=${jid}, senderPn=${msg.key.senderPn || "-"}, participantPn=${msg.key.participantPn || "-"}`,
+      `[msg] incoming: type=${type}, jid=${jid}, senderPn=${msg.key.senderPn || extraPn || "-"}, participantPn=${msg.key.participantPn || "-"}`,
     );
 
     const sb = getSupabase();
     const shopId = this.info.shopId;
-    const phone = this.resolveRealNumber(msg);
-    if (!phone) return;
-
+    let phone = this.resolveRealNumber(msg);
     const lidDigits = jid.includes("@lid") ? jidUserDigits(jid) : "";
+    if (lidDigits && (!isMobileDigits(phone) || phone === lidDigits)) {
+      const via = await this.resolveLidViaUsync(lidDigits);
+      if (via) phone = via;
+    }
+    if (!phone) return;
     // Remember which exact jid this phone number messaged from, so replies
     // (especially to @lid contacts) go back to the correct chat after a restart.
     this.rememberChatJid(phone, jid);
@@ -928,6 +1027,10 @@ export class Session {
    * Resolve a bare phone number to the correct outbound JID. Prefers the exact
    * jid we last saw this phone number message from — critical for @lid
    * contacts, since phone@s.whatsapp.net does not reach them.
+   *
+   * When the owner adds a real number in the dashboard (no inbound yet), we
+   * usync that number so a LID-mode session sends to lid@lid instead of
+   * number@s.whatsapp.net ("Waiting for this message").
    */
   private toJid(phone: string): string {
     const digits = phone.replace(/\D/g, "");
@@ -936,15 +1039,49 @@ export class Session {
     for (const [lid, mappedPhone] of this.lidToPhone) {
       if (mappedPhone === digits || lid === digits) return `${lid}@lid`;
     }
-    // Opaque LID ids (14+ digits) must stay @lid. Sending them as
-    // @s.whatsapp.net is accepted, then the phone cannot decrypt the bytes.
     if (digits.length >= 14) return `${digits}@lid`;
     return `${digits}@s.whatsapp.net`;
   }
 
-  private async showTyping(phone: string, durationMs: number = 2000): Promise<void> {
+  private async resolveOutboundJid(phone: string): Promise<string> {
+    const digits = phone.replace(/\D/g, "");
+    const remembered = this.phoneToChatJid.get(digits);
+
+    // Already talking to this contact on their LID chat — keep that address.
+    if (remembered?.includes("@lid")) return remembered;
+
+    if (digits.length >= 14) {
+      const mapped = this.lidToPhone.get(digits);
+      if (mapped) {
+        const mappedJid = this.phoneToChatJid.get(mapped);
+        if (mappedJid) return mappedJid;
+        return `${digits}@lid`;
+      }
+      return `${digits}@lid`;
+    }
+
+    for (const [lid, mappedPhone] of this.lidToPhone) {
+      if (mappedPhone === digits) {
+        return this.phoneToChatJid.get(digits) || `${lid}@lid`;
+      }
+    }
+
+    // First outbound to a real number (manual "new conversation"): discover LID.
+    if (!remembered && isMobileDigits(digits)) {
+      const lidJid = await this.lookupPnLid(digits);
+      if (lidJid) {
+        this.rememberChatJid(digits, lidJid);
+        return lidJid;
+      }
+    }
+
+    if (remembered) return remembered;
+    return `${digits}@s.whatsapp.net`;
+  }
+
+  private async showTyping(phone: string, durationMs: number = 2000, jidOverride?: string): Promise<void> {
     if (!this.sock) return;
-    const jid = this.toJid(phone);
+    const jid = jidOverride || this.toJid(phone);
     // Composing to @lid without creds.me.lid sends from=undefined and can
     // leave the next real message undecryptable. Skip typing on LID chats.
     if (jid.endsWith("@lid") && !this.sock.authState?.creds?.me?.lid) return;
@@ -965,12 +1102,12 @@ export class Session {
 
   async sendText(phone: string, message: string, showTyping: boolean = true): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
-    const jid = this.toJid(phone);
+    const jid = await this.resolveOutboundJid(phone);
     
     // Show typing indicator before sending (simulate human typing)
     if (showTyping) {
       const typingDuration = Math.min(Math.max(message.length * 30, 800), 3000);
-      await this.showTyping(phone, typingDuration);
+      await this.showTyping(phone, typingDuration, jid);
     }
     
     console.log(`[send] text to ${jid} (from ${phone})`);
@@ -980,11 +1117,11 @@ export class Session {
 
   async sendImage(phone: string, imageUrl: string, caption?: string, showTyping: boolean = true): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
-    const jid = this.toJid(phone);
+    const jid = await this.resolveOutboundJid(phone);
     
     // Show typing indicator before sending image
     if (showTyping) {
-      await this.showTyping(phone, 1500); // 1.5 seconds typing for images
+      await this.showTyping(phone, 1500, jid); // 1.5 seconds typing for images
     }
     
     try {
@@ -1012,11 +1149,11 @@ export class Session {
     showTyping: boolean = true,
   ): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
-    const jid = this.toJid(phone);
+    const jid = await this.resolveOutboundJid(phone);
 
     // Show typing indicator before sending audio
     if (showTyping) {
-      await this.showTyping(phone, 1500); // 1.5 seconds typing for audio
+      await this.showTyping(phone, 1500, jid); // 1.5 seconds typing for audio
     }
 
     // Baileys needs the actual audio bytes (a Buffer), not a remote URL, to
@@ -1045,7 +1182,7 @@ export class Session {
 
   async editMessage(waMessageId: string, phone: string, newText: string): Promise<void> {
     if (!this.sock) throw new Error("Session not connected");
-    const jid = this.toJid(phone);
+    const jid = await this.resolveOutboundJid(phone);
     await this.sock.sendMessage(jid, {
       text: newText,
       edit: { remoteJid: jid, id: waMessageId, fromMe: true },
@@ -1054,7 +1191,7 @@ export class Session {
 
   async deleteMessage(waMessageId: string, phone: string): Promise<void> {
     if (!this.sock) throw new Error("Session not connected");
-    const jid = this.toJid(phone);
+    const jid = await this.resolveOutboundJid(phone);
     await this.sock.sendMessage(jid, {
       delete: { remoteJid: jid, id: waMessageId, fromMe: true },
     });

@@ -219,22 +219,34 @@ export class Session {
     }
   }
 
+  private keyFields(key: WAMessageKey): Record<string, string | undefined> {
+    return key as unknown as Record<string, string | undefined>;
+  }
+
+  private lidMapping(): {
+    getPNForLID?: (jid: string) => Promise<string | null>;
+    getLIDForPN?: (jid: string) => Promise<string | null>;
+    storeLIDPNMappings?: (pairs: Array<{ lid: string; pn: string }>) => Promise<void>;
+  } | undefined {
+    return (this.sock as { signalRepository?: { lidMapping?: ReturnType<Session["lidMapping"]> } } | null)?.signalRepository?.lidMapping;
+  }
+
   private keyPn(key: WAMessageKey): string {
-    const extra = key as WAMessageKey & { senderPn?: string; participantPn?: string };
+    const extra = this.keyFields(key);
     return (
-      this.phoneFromPn(key.remoteJidAlt) ||
+      this.phoneFromPn(extra.remoteJidAlt) ||
       this.phoneFromPn(extra.senderPn) ||
       this.phoneFromPn(extra.participantPn) ||
-      this.phoneFromPn(key.participantAlt) ||
+      this.phoneFromPn(extra.participantAlt) ||
       ""
     );
   }
 
   private keyLid(key: WAMessageKey): string {
-    const extra = key as WAMessageKey & { senderLid?: string; participantLid?: string };
+    const extra = this.keyFields(key);
     const jid = key.remoteJid || "";
     if (jid.includes("@lid")) return jid;
-    if (String(key.remoteJidAlt || "").includes("@lid")) return String(key.remoteJidAlt);
+    if (String(extra.remoteJidAlt || "").includes("@lid")) return String(extra.remoteJidAlt);
     if (extra.senderLid) return extra.senderLid;
     if (extra.participantLid) return extra.participantLid;
     return "";
@@ -245,8 +257,8 @@ export class Session {
     if (!lidJid || !ph) return;
     this.rememberLid(lidJid, ph);
     try {
-      const mapping = this.sock?.signalRepository?.lidMapping;
-      if (!mapping) return;
+      const mapping = this.lidMapping();
+      if (!mapping?.storeLIDPNMappings) return;
       const lid = lidJid.includes("@") ? lidJid : `${jidUserDigits(lidJid)}@lid`;
       await mapping.storeLIDPNMappings([{ lid, pn: `${ph}@s.whatsapp.net` }]);
     } catch {
@@ -366,7 +378,7 @@ export class Session {
     sock.ev.on("contacts.upsert", onContacts);
     sock.ev.on("contacts.update", onContacts);
 
-    sock.ev.on("lid-mapping.update", (pair) => {
+    sock.ev.on("lid-mapping.update" as any, (pair: { pn?: string; lid?: string }) => {
       const phone = this.phoneFromPn(pair?.pn);
       if (pair?.lid && phone) {
         void this.persistLidPn(pair.lid, phone);
@@ -546,7 +558,7 @@ export class Session {
     const lidDigits = jid.includes("@lid") ? jidUserDigits(jid) : "";
     if (!lidDigits || (sync && sync !== lidDigits && this.phoneFromPn(sync))) return sync;
     try {
-      const pn = await this.sock?.signalRepository?.lidMapping.getPNForLID(jid);
+      const pn = await this.lidMapping()?.getPNForLID?.(jid);
       const mapped = this.phoneFromPn(pn);
       if (mapped) {
         void this.persistLidPn(jid, mapped);
@@ -602,7 +614,8 @@ export class Session {
         .filter((p) => p.length >= 6 && !this.mappedPhones.has(p));
       if (phones.length === 0) return "";
 
-      const mapping = this.sock.signalRepository.lidMapping;
+      const mapping = this.lidMapping();
+      if (!mapping?.getLIDForPN) return "";
       for (const p of phones) {
         const lidJid = await mapping.getLIDForPN(`${p}@s.whatsapp.net`);
         if (lidJid) {
@@ -640,7 +653,7 @@ export class Session {
 
     const type = Object.keys(content)[0] || "";
     console.log(
-      `[msg] incoming: type=${type}, jid=${jid}, alt=${msg.key.remoteJidAlt || "-"}`,
+      `[msg] incoming: type=${type}, jid=${jid}, alt=${this.keyFields(msg.key).remoteJidAlt || "-"}`,
     );
 
     const sb = getSupabase();
@@ -854,7 +867,7 @@ export class Session {
     if (!content) return;
 
     const type = Object.keys(content)[0] || "";
-    console.log(`[msg] owner-sent (manual): type=${type}, jid=${jid.slice(0, 40)}, alt=${msg.key.remoteJidAlt || "-"}`);
+    console.log(`[msg] owner-sent (manual): type=${type}, jid=${jid.slice(0, 40)}, alt=${this.keyFields(msg.key).remoteJidAlt || "-"}`);
 
     const sb = getSupabase();
     const shopId = this.info.shopId;

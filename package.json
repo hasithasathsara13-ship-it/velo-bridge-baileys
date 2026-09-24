@@ -12,9 +12,9 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "2.49.1",
-    "@whiskeysockets/baileys": "6.7.24",
-    "express": "4.21.0",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
     "dotenv": "16.4.7",
+    "express": "4.21.0",
     "pino": "9.6.0",
     "qrcode": "1.5.4",
     "ws": "8.18.0"
@@ -23,8 +23,8 @@
     "@types/express": "5.0.0",
     "@types/node": "22.0.0",
     "@types/qrcode": "1.5.5",
-    "typescript": "5.5.4",
-    "tsx": "4.19.2"
+    "tsx": "4.19.2",
+    "typescript": "5.5.4"
   },
   "engines": {
     "node": ">=20.0.0"

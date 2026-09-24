@@ -1,13 +1,15 @@
 import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
-  fetchLatestBaileysVersion,
   downloadMediaMessage,
   makeCacheableSignalKeyStore,
   normalizeMessageContent,
+  proto,
   type WASocket,
   type WAMessage,
+  type WAMessageKey,
   type ConnectionState,
+  type Contact,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import { pino } from "pino";
@@ -114,6 +116,9 @@ export class Session {
   // replies) from messages the owner typed manually on their paired phone.
   private pendingBridgeSends = new Map<string, number>();
   private bridgeSentMessageIds = new Set<string>();
+  // Outbound/inbound proto bodies so Baileys can satisfy retry receipts
+  // (fixes "Waiting for this message" when the phone asks for a resend).
+  private recentMessages = new Map<string, proto.IMessage>();
 
   constructor(shopId: string, phoneForPairing?: string) {
     this.info = { shopId, status: "connecting", qrCode: null, pairingCode: null, phoneNumber: null };
@@ -195,7 +200,54 @@ export class Session {
     if (!raw || raw.includes("@lid")) return "";
     const digits = jidUserDigits(raw);
     if (digits.length < 8 || digits.length > 15) return "";
+    // Bare 14–15 digit ids are usually LIDs, not E.164 mobiles.
+    if (!raw.includes("@s.whatsapp.net") && !raw.includes("@c.us") && digits.length >= 14) return "";
     return digits;
+  }
+
+  private cacheMessage(id: string | null | undefined, message: proto.IMessage | null | undefined): void {
+    if (!id || !message) return;
+    this.recentMessages.set(id, message);
+    if (this.recentMessages.size > 300) {
+      const first = this.recentMessages.keys().next().value;
+      if (first) this.recentMessages.delete(first);
+    }
+  }
+
+  private keyPn(key: WAMessageKey): string {
+    const extra = key as WAMessageKey & { senderPn?: string; participantPn?: string };
+    return (
+      this.phoneFromPn(key.remoteJidAlt) ||
+      this.phoneFromPn(extra.senderPn) ||
+      this.phoneFromPn(extra.participantPn) ||
+      this.phoneFromPn(key.participantAlt) ||
+      ""
+    );
+  }
+
+  private keyLid(key: WAMessageKey): string {
+    const extra = key as WAMessageKey & { senderLid?: string; participantLid?: string };
+    const jid = key.remoteJid || "";
+    if (jid.includes("@lid")) return jid;
+    if (String(key.remoteJidAlt || "").includes("@lid")) return String(key.remoteJidAlt);
+    if (extra.senderLid) return extra.senderLid;
+    if (extra.participantLid) return extra.participantLid;
+    return "";
+  }
+
+  private async persistLidPn(lidJid: string | null | undefined, phone: string): Promise<void> {
+    const ph = String(phone || "").replace(/\D/g, "");
+    if (!lidJid || !ph) return;
+    this.rememberLid(lidJid, ph);
+    this.rememberChatJid(ph, lidJid.includes("@") ? lidJid : `${jidUserDigits(lidJid)}@lid`);
+    try {
+      const mapping = this.sock?.signalRepository?.lidMapping;
+      if (!mapping) return;
+      const lid = lidJid.includes("@") ? lidJid : `${jidUserDigits(lidJid)}@lid`;
+      await mapping.storeLIDPNMappings([{ lid, pn: `${ph}@s.whatsapp.net` }]);
+    } catch {
+      /* mapping store is best-effort */
+    }
   }
 
   /**
@@ -251,10 +303,8 @@ export class Session {
 
     const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
     this.saveCreds = saveCreds;
-    const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
-      version,
       logger,
       auth: {
         creds: state.creds,
@@ -263,6 +313,11 @@ export class Session {
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      maxMsgRetryCount: 5,
+      getMessage: async (key) => {
+        const id = key?.id || "";
+        return (id && this.recentMessages.get(id)) || undefined;
+      },
     });
     this.sock = sock;
 
@@ -290,33 +345,37 @@ export class Session {
       }
     });
 
-    // Contact syncs are the richest source of lid<->phone pairs: Baileys'
-    // Contact carries both `lid` and `jid` for privacy-mode contacts.
-    const onContacts = (contacts: Array<{ id?: string; lid?: string; jid?: string }>) => {
+    // Contact syncs are the richest source of lid<->phone pairs. Baileys 7
+    // Contact is { id, lid?, phoneNumber? }.
+    const onContacts = (contacts: Array<Partial<Contact> & { id?: string }>) => {
       for (const c of contacts || []) {
-        const phoneJid = c.jid || (c.id && !c.id.includes("@lid") ? c.id : "");
-        const lidJid = c.lid || (c.id && c.id.includes("@lid") ? c.id : "");
-        const phone = this.phoneFromPn(phoneJid) || (phoneJid && !phoneJid.includes("@lid") ? jidUserDigits(phoneJid) : "");
-        if (lidJid && phone && phone.length <= 15) {
-          this.rememberLid(lidJid, phone);
-          this.rememberChatJid(phone, lidJid.includes("@") ? lidJid : `${jidUserDigits(lidJid)}@lid`);
+        const id = c.id || "";
+        const phoneJid = c.phoneNumber || (!id.includes("@lid") ? id : "");
+        const lidJid = c.lid || (id.includes("@lid") ? id : "");
+        const phone = this.phoneFromPn(phoneJid);
+        if (lidJid && phone) {
+          void this.persistLidPn(lidJid.includes("@") ? lidJid : `${jidUserDigits(lidJid)}@lid`, phone);
           void this.migrateStoredPhone(jidUserDigits(lidJid), phone);
         }
       }
     };
     sock.ev.on("contacts.upsert", onContacts);
-    sock.ev.on("contacts.update", onContacts as any);
+    sock.ev.on("contacts.update", onContacts);
+
+    sock.ev.on("lid-mapping.update", (pair) => {
+      const phone = this.phoneFromPn(pair?.pn);
+      if (pair?.lid && phone) {
+        void this.persistLidPn(pair.lid, phone);
+        void this.migrateStoredPhone(jidUserDigits(pair.lid), phone);
+      }
+    });
 
     // Emitted when a contact shares their phone number for a LID chat.
     sock.ev.on("chats.phoneNumberShare" as any, (update: { lid?: string; jid?: string }) => {
-      const phone = this.phoneFromPn(update?.jid) || jidUserDigits(update?.jid);
-      const lid = jidUserDigits(update?.lid);
-      if (update?.lid && phone && phone.length <= 15) {
-        this.rememberLid(update.lid, phone);
-        if (lid) {
-          this.rememberChatJid(phone, String(update.lid).includes("@") ? String(update.lid) : `${lid}@lid`);
-          void this.migrateStoredPhone(lid, phone);
-        }
+      const phone = this.phoneFromPn(update?.jid);
+      if (update?.lid && phone) {
+        void this.persistLidPn(update.lid, phone);
+        void this.migrateStoredPhone(jidUserDigits(update.lid), phone);
       }
     });
 
@@ -356,10 +415,13 @@ export class Session {
       this.info.qrCode = null;
       this.info.pairingCode = null;
       try {
-        const me = this.sock?.authState?.creds?.me;
+        const me = this.sock?.authState?.creds?.me as { id?: string; jid?: string; phoneNumber?: string } | undefined;
         const id = me?.id || this.sock?.user?.id || "";
-        const phoneJid = me?.jid && !String(me.jid).includes("@lid") ? String(me.jid) : (!id.includes("@lid") ? id : "");
-        this.info.phoneNumber = jidUserDigits(phoneJid) || null;
+        const phoneJid =
+          this.phoneFromPn(me?.phoneNumber) ||
+          this.phoneFromPn(me?.jid) ||
+          (!id.includes("@lid") ? jidUserDigits(id) : "");
+        this.info.phoneNumber = phoneJid || null;
         if (!this.info.phoneNumber && id.includes("@lid")) {
           console.warn(`[session ${this.info.shopId}] connected identity is a LID (${id}); waiting for the phone jid`);
         }
@@ -432,9 +494,11 @@ export class Session {
     this.pendingBridgeSends.set(jid, (this.pendingBridgeSends.get(jid) || 0) + 1);
     try {
       const result = await fn();
-      const id = result?.key?.id || "";
+      const sent = result as { key?: { id?: string | null }; message?: proto.IMessage } | null | undefined;
+      const id = sent?.key?.id || "";
       if (id) {
         this.bridgeSentMessageIds.add(id);
+        this.cacheMessage(id, sent?.message);
         setTimeout(() => this.bridgeSentMessageIds.delete(id), 15000);
       }
       return result;
@@ -461,10 +525,8 @@ export class Session {
 
   private resolveRealNumber(msg: WAMessage): string {
     const jid = msg.key.remoteJid || "";
-    // New WhatsApp accounts address 1:1 chats as <lid>@lid. The real mobile
-    // is on senderPn / participantPn when WhatsApp includes it. Older paired
-    // numbers still put the phone in remoteJid, so they never hit this path.
-    const fromPn = this.phoneFromPn(msg.key.senderPn) || this.phoneFromPn(msg.key.participantPn);
+    // Baileys 7 puts the PN on remoteJidAlt when the chat is @lid.
+    const fromPn = this.keyPn(msg.key);
     if (fromPn) return fromPn;
     if (jid.includes("@lid")) {
       const known = this.lidToPhone.get(jidUserDigits(jid));
@@ -472,6 +534,24 @@ export class Session {
     }
     if (!jid.includes("@lid")) return jidUserDigits(jid);
     return jidUserDigits(jid);
+  }
+
+  private async resolveRealNumberAsync(msg: WAMessage): Promise<string> {
+    const jid = msg.key.remoteJid || "";
+    const sync = this.resolveRealNumber(msg);
+    const lidDigits = jid.includes("@lid") ? jidUserDigits(jid) : "";
+    if (!lidDigits || (sync && sync !== lidDigits && this.phoneFromPn(sync))) return sync;
+    try {
+      const pn = await this.sock?.signalRepository?.lidMapping.getPNForLID(jid);
+      const mapped = this.phoneFromPn(pn);
+      if (mapped) {
+        void this.persistLidPn(jid, mapped);
+        return mapped;
+      }
+    } catch {
+      /* fall through */
+    }
+    return sync;
   }
 
   /** Resolve the customer's real phone number for an owner-sent (fromMe)
@@ -518,19 +598,13 @@ export class Session {
         .filter((p) => p.length >= 6 && !this.mappedPhones.has(p));
       if (phones.length === 0) return "";
 
-      // Query in modest batches so one huge usync call can't stall the socket.
-      for (let i = 0; i < phones.length; i += 25) {
-        const batch = phones.slice(i, i + 25);
-        const results = (await (this.sock as any).onWhatsApp(
-          ...batch.map((p) => `${p}@s.whatsapp.net`),
-        )) as Array<{ jid?: string; lid?: string; exists?: boolean }> | undefined;
-
-        for (const r of results || []) {
-          const phone = jidUserDigits(r?.jid);
-          const rLid = jidUserDigits(r?.lid);
-          if (rLid && phone) this.rememberLid(rLid, phone);
+      const mapping = this.sock.signalRepository.lidMapping;
+      for (const p of phones) {
+        const lidJid = await mapping.getLIDForPN(`${p}@s.whatsapp.net`);
+        if (lidJid) {
+          this.rememberLid(lidJid, p);
+          if (jidUserDigits(lidJid) === lid) return p;
         }
-
         const hit = this.lidToPhone.get(lid);
         if (hit) return hit;
       }
@@ -562,13 +636,15 @@ export class Session {
 
     const type = Object.keys(content)[0] || "";
     console.log(
-      `[msg] incoming: type=${type}, jid=${jid}, senderPn=${msg.key.senderPn || "-"}, participantPn=${msg.key.participantPn || "-"}`,
+      `[msg] incoming: type=${type}, jid=${jid}, alt=${msg.key.remoteJidAlt || "-"}`,
     );
 
     const sb = getSupabase();
     const shopId = this.info.shopId;
-    const phone = this.resolveRealNumber(msg);
+    const phone = await this.resolveRealNumberAsync(msg);
     if (!phone) return;
+
+    this.cacheMessage(msgId, msg.message);
 
     const lidDigits = jid.includes("@lid") ? jidUserDigits(jid) : "";
     // Remember which exact jid this phone number messaged from, so replies
@@ -578,11 +654,9 @@ export class Session {
       this.rememberChatJid(lidDigits, jid);
       void this.migrateStoredPhone(lidDigits, phone);
     }
-    // Record every LID form WhatsApp gave us for this contact so a later
-    // owner-sent (fromMe) message addressed via @lid resolves back to this phone.
-    this.rememberLid(msg.key.senderLid, phone);
-    this.rememberLid(msg.key.participantLid, phone);
-    if (jid.includes("@lid")) this.rememberLid(jid, phone);
+    const extraLid = this.keyLid(msg.key);
+    if (extraLid) void this.persistLidPn(extraLid, phone);
+    if (jid.includes("@lid")) void this.persistLidPn(jid, phone);
 
     let textContent = "";
     let mediaUrl: string | null = null;
@@ -776,8 +850,7 @@ export class Session {
     if (!content) return;
 
     const type = Object.keys(content)[0] || "";
-    console.log(`[msg] owner-sent (manual): type=${type}, jid=${jid.slice(0, 20)}`);
-    console.log(`[msg] owner-sent key: remoteJid=${jid}, senderLid=${msg.key.senderLid || "-"}, senderPn=${msg.key.senderPn || "-"}, participantLid=${msg.key.participantLid || "-"}, participantPn=${msg.key.participantPn || "-"}`);
+    console.log(`[msg] owner-sent (manual): type=${type}, jid=${jid.slice(0, 40)}, alt=${msg.key.remoteJidAlt || "-"}`);
 
     const sb = getSupabase();
     const shopId = this.info.shopId;
@@ -935,8 +1008,9 @@ export class Session {
     // but the phone cannot decrypt it ("Waiting for this message").
     // Normal shops keep @s.whatsapp.net, which is the jid they actually use.
     if (remembered) return remembered;
-    for (const [lid, mappedPhone] of this.lidToPhone) {
-      if (mappedPhone === digits || lid === digits) return `${lid}@lid`;
+    if (digits.length >= 14) return `${digits}@lid`;
+    for (const [lid] of this.lidToPhone) {
+      if (lid === digits) return `${lid}@lid`;
     }
     return `${digits}@s.whatsapp.net`;
   }

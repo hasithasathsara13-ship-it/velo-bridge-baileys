@@ -184,12 +184,17 @@ export class Session {
     }
   }
 
-  /** Remember the exact chat jid (often @lid) a phone must be replied to. */
+  /** Remember the outbound jid for a phone. Real mobiles stay on @s.whatsapp.net.
+   *  Sending those chats to @lid is rejected with 479 (smax-invalid). */
   private rememberChatJid(phoneDigits: string, jid: string): void {
     const phone = String(phoneDigits || "").replace(/\D/g, "");
     if (!phone || !jid || jid === "status@broadcast" || jid.endsWith("@g.us")) return;
-    if (this.phoneToChatJid.get(phone) === jid) return;
-    this.phoneToChatJid.set(phone, jid);
+    let dest = jid;
+    if (dest.includes("@lid") && this.phoneFromPn(phone)) {
+      dest = `${phone}@s.whatsapp.net`;
+    }
+    if (this.phoneToChatJid.get(phone) === dest) return;
+    this.phoneToChatJid.set(phone, dest);
     this.chatJidDirty = true;
     this.saveChatJids();
   }
@@ -239,7 +244,6 @@ export class Session {
     const ph = String(phone || "").replace(/\D/g, "");
     if (!lidJid || !ph) return;
     this.rememberLid(lidJid, ph);
-    this.rememberChatJid(ph, lidJid.includes("@") ? lidJid : `${jidUserDigits(lidJid)}@lid`);
     try {
       const mapping = this.sock?.signalRepository?.lidMapping;
       if (!mapping) return;
@@ -1003,15 +1007,16 @@ export class Session {
   private toJid(phone: string): string {
     const digits = phone.replace(/\D/g, "");
     const remembered = this.phoneToChatJid.get(digits);
-    // Use the exact chat the customer wrote from. A LID chat must be answered
-    // on @lid. Sending those digits to @s.whatsapp.net still shows the message,
-    // but the phone cannot decrypt it ("Waiting for this message").
-    // Normal shops keep @s.whatsapp.net, which is the jid they actually use.
-    if (remembered) return remembered;
-    if (digits.length >= 14) return `${digits}@lid`;
-    for (const [lid] of this.lidToPhone) {
-      if (lid === digits) return `${lid}@lid`;
+    // Real phone numbers must be sent as @s.whatsapp.net. Baileys 7 maps LID
+    // internally. Forcing @lid made WhatsApp ack 479 and drop the message.
+    if (this.phoneFromPn(digits) || (digits.length >= 8 && digits.length <= 13)) {
+      if (remembered && !remembered.includes("@lid")) return remembered;
+      return `${digits}@s.whatsapp.net`;
     }
+    if (remembered) return remembered;
+    const mappedPhone = this.lidToPhone.get(digits);
+    if (mappedPhone) return `${mappedPhone}@s.whatsapp.net`;
+    if (digits.length >= 14) return `${digits}@lid`;
     return `${digits}@s.whatsapp.net`;
   }
 

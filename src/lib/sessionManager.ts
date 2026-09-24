@@ -329,7 +329,8 @@ export class Session {
       printQRInTerminal: false,
       markOnlineOnConnect: false,
       syncFullHistory: false,
-      maxMsgRetryCount: 5,
+      maxMsgRetryCount: 8,
+      shouldIgnoreJid: (jid) => jid === "status@broadcast",
       getMessage: async (key) => {
         const id = key?.id || "";
         return (id && this.recentMessages.get(id)) || undefined;
@@ -352,12 +353,13 @@ export class Session {
         } else if (type !== "notify") {
           continue;
         }
-        if (msg.key.fromMe) {
-          if (this.isBridgeInitiated(msg)) continue;
-          this.handleOwnerSentMessage(msg).catch((e) => console.error("[msg-owner]", e));
-          continue;
-        }
-        this.handleIncoming(msg).catch((e) => console.error("[msg]", e));
+        this.dispatchWaMessage(msg);
+      }
+    });
+    sock.ev.on("messages.update", (updates) => {
+      for (const u of updates || []) {
+        if (!u?.update?.message || !u.key) continue;
+        this.dispatchWaMessage({ key: u.key, message: u.update.message } as WAMessage);
       }
     });
 
@@ -501,6 +503,31 @@ export class Session {
     }
   }
 
+  private dispatchWaMessage(msg: WAMessage): void {
+    const jid = msg.key.remoteJid || "";
+    if (!jid || jid === "status@broadcast" || jid.endsWith("@g.us")) return;
+    if (msg.key.fromMe) {
+      if (this.isBridgeInitiated(msg)) return;
+      this.handleOwnerSentMessage(msg).catch((e) => console.error("[msg-owner]", e));
+      return;
+    }
+    this.handleIncoming(msg).catch((e) => console.error("[msg]", e));
+  }
+
+  private isChatContent(content: proto.IMessage | null | undefined): content is proto.IMessage {
+    if (!content) return false;
+    if (content.protocolMessage || content.senderKeyDistributionMessage || content.reactionMessage) return false;
+    return Boolean(
+      content.conversation ||
+      content.extendedTextMessage ||
+      content.imageMessage ||
+      content.audioMessage ||
+      content.videoMessage ||
+      content.documentMessage ||
+      content.stickerMessage,
+    );
+  }
+
   // ─── Bridge-send tracking ────────────────────────────────────────────────
 
   private async trackBridgeSend<T extends { key?: { id?: string | null } } | null | undefined>(
@@ -570,30 +597,22 @@ export class Session {
     return sync;
   }
 
-  /** Resolve the customer's real phone number for an owner-sent (fromMe)
-   *  message. WhatsApp never attaches a recipient's phone number to an
-   *  outbound stanza, so for privacy-mode contacts the jid is a @lid and we
-   *  must map it back ourselves. */
   private async resolveOwnerCounterpartyNumber(msg: WAMessage): Promise<string> {
-    const jid = msg.key.remoteJid || "";
+    const fromPn = this.resolveRealNumber(msg);
+    if (fromPn && this.phoneFromPn(fromPn)) return fromPn;
 
-    // Non-LID chats already carry the real number in the jid.
-    if (!jid.includes("@lid")) return this.resolveRealNumber(msg);
+    const jid = msg.key.remoteJid || "";
+    if (!jid.includes("@lid")) return fromPn;
 
     const lid = jidUserDigits(jid);
-
-    // 1. Known mapping (from prior inbound messages / contacts / disk).
     const known = this.lidToPhone.get(lid);
     if (known) return known;
 
-    // 2. Ask WhatsApp: usync returns { jid, exists, lid } per phone, so we can
-    //    reverse-match this LID against the phone numbers we already know for
-    //    this shop. Self-healing after a restart with an empty/partial map.
     const resolved = await this.resolveLidViaUsync(lid).catch(() => "");
     if (resolved) return resolved;
 
     console.warn(`[session ${this.info.shopId}] could not map lid ${lid} to a phone number; falling back to lid digits`);
-    return this.resolveRealNumber(msg);
+    return fromPn;
   }
 
   /** Look up this shop's known customer numbers via usync and find which one
@@ -611,19 +630,35 @@ export class Session {
 
       const phones = (data || [])
         .map((r) => String((r as { phone_number?: string }).phone_number || "").replace(/\D/g, ""))
-        .filter((p) => p.length >= 6 && !this.mappedPhones.has(p));
+        .filter((p) => p.length >= 8 && p.length <= 13);
       if (phones.length === 0) return "";
 
       const mapping = this.lidMapping();
-      if (!mapping?.getLIDForPN) return "";
-      for (const p of phones) {
-        const lidJid = await mapping.getLIDForPN(`${p}@s.whatsapp.net`);
-        if (lidJid) {
-          this.rememberLid(lidJid, p);
-          if (jidUserDigits(lidJid) === lid) return p;
+      if (mapping?.getLIDForPN) {
+        for (const p of phones) {
+          const lidJid = await mapping.getLIDForPN(`${p}@s.whatsapp.net`);
+          if (lidJid) {
+            this.rememberLid(lidJid, p);
+            if (jidUserDigits(lidJid) === lid) return p;
+          }
+          const hit = this.lidToPhone.get(lid);
+          if (hit) return hit;
         }
-        const hit = this.lidToPhone.get(lid);
-        if (hit) return hit;
+      }
+
+      const onWhatsApp = (this.sock as { onWhatsApp?: (...jids: string[]) => Promise<Array<{ jid?: string; lid?: string }> | undefined> }).onWhatsApp;
+      if (onWhatsApp) {
+        for (let i = 0; i < phones.length; i += 20) {
+          const batch = phones.slice(i, i + 20);
+          const results = await onWhatsApp(...batch.map((p) => `${p}@s.whatsapp.net`));
+          for (const r of results || []) {
+            const phone = this.phoneFromPn(r?.jid) || jidUserDigits(r?.jid);
+            const rLid = jidUserDigits(r?.lid);
+            if (rLid && phone) this.rememberLid(rLid, phone);
+          }
+          const hit = this.lidToPhone.get(lid);
+          if (hit) return hit;
+        }
       }
     } catch (e: any) {
       console.warn(`[session ${this.info.shopId}] usync lid lookup failed:`, e?.message || e);
@@ -636,11 +671,6 @@ export class Session {
     if (!jid || jid === "status@broadcast" || jid.endsWith("@g.us") || msg.key.fromMe) return;
 
     const msgId = msg.key.id || "";
-    if (msgId) {
-      if (this.processedMsgIds.has(msgId)) return;
-      this.processedMsgIds.add(msgId);
-      if (this.processedMsgIds.size > 1000) this.processedMsgIds.clear();
-    }
 
     // Unwrap envelope types (documentWithCaptionMessage, viewOnceMessage,
     // ephemeralMessage, editedMessage, …) so the real content (e.g. the
@@ -649,7 +679,17 @@ export class Session {
     // documentWithCaptionMessage and is silently dropped as an empty text
     // message.
     const content = normalizeMessageContent(msg.message);
-    if (!content) return;
+    if (!this.isChatContent(content)) {
+      if (!content && msgId) {
+        console.warn(`[msg] still encrypted, will retry: jid=${jid} id=${msgId}`);
+      }
+      return;
+    }
+    if (msgId) {
+      if (this.processedMsgIds.has(msgId)) return;
+      this.processedMsgIds.add(msgId);
+      if (this.processedMsgIds.size > 1000) this.processedMsgIds.clear();
+    }
 
     const type = Object.keys(content)[0] || "";
     console.log(
@@ -857,14 +897,13 @@ export class Session {
     if (!jid || jid === "status@broadcast" || jid.endsWith("@g.us")) return;
 
     const msgId = msg.key.id || "";
+    const content = normalizeMessageContent(msg.message);
+    if (!this.isChatContent(content)) return;
     if (msgId) {
       if (this.processedMsgIds.has(msgId)) return;
       this.processedMsgIds.add(msgId);
       if (this.processedMsgIds.size > 1000) this.processedMsgIds.clear();
     }
-
-    const content = normalizeMessageContent(msg.message);
-    if (!content) return;
 
     const type = Object.keys(content)[0] || "";
     console.log(`[msg] owner-sent (manual): type=${type}, jid=${jid.slice(0, 40)}, alt=${this.keyFields(msg.key).remoteJidAlt || "-"}`);

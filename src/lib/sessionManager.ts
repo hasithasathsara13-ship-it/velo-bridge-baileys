@@ -119,6 +119,7 @@ export class Session {
   // Outbound/inbound proto bodies so Baileys can satisfy retry receipts
   // (fixes "Waiting for this message" when the phone asks for a resend).
   private recentMessages = new Map<string, proto.IMessage>();
+  private placeholderResendRequested = new Set<string>();
 
   constructor(shopId: string, phoneForPairing?: string) {
     this.info = { shopId, status: "connecting", qrCode: null, pairingCode: null, phoneNumber: null };
@@ -680,8 +681,15 @@ export class Session {
     // message.
     const content = normalizeMessageContent(msg.message);
     if (!this.isChatContent(content)) {
-      if (!content && msgId) {
-        console.warn(`[msg] still encrypted, will retry: jid=${jid} id=${msgId}`);
+      if (!content && msgId && !this.placeholderResendRequested.has(msgId)) {
+        this.placeholderResendRequested.add(msgId);
+        setTimeout(() => this.placeholderResendRequested.delete(msgId), 120000);
+        console.warn(`[msg] still encrypted, asking phone to resend: jid=${jid} id=${msgId}`);
+        void (this.sock as { requestPlaceholderResend?: (key: WAMessageKey) => Promise<unknown> } | null)
+          ?.requestPlaceholderResend?.(msg.key)
+          .catch((e: { message?: string }) =>
+            console.warn(`[msg] placeholder resend failed:`, e?.message || e),
+          );
       }
       return;
     }

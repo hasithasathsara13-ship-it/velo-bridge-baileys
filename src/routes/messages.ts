@@ -93,6 +93,32 @@ messageRouter.post("/send-audio", async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /message/send-document or /message/send-video
+ * Body: { shop_id, phone_number, file_url, mimetype, file_name }
+ */
+for (const kind of ["document", "video"] as const) {
+  messageRouter.post(`/send-${kind}`, async (req: Request, res: Response) => {
+    const { shop_id, phone_number, file_url, mimetype, file_name } = req.body as {
+      shop_id?: string; phone_number?: string; file_url?: string; mimetype?: string; file_name?: string;
+    };
+    if (!shop_id || !phone_number || !file_url) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+    const session = getSession(shop_id);
+    if (!session || session.getInfo().status !== "connected") {
+      return res.status(404).json({ error: "Session not connected" });
+    }
+    try {
+      const result = await session.sendFile(phone_number, kind, file_url, mimetype || "", file_name || "file");
+      res.json({ ok: true, id: result.id, wa_message_id: result.id });
+    } catch (err: any) {
+      console.error(`[message/send-${kind}]`, err);
+      res.status(500).json({ error: err.message || "Send failed" });
+    }
+  });
+}
+
+/**
  * POST /message/edit
  * Body: { shop_id, phone_number, wa_message_id, new_text }
  */
@@ -116,6 +142,14 @@ messageRouter.post("/edit", async (req: Request, res: Response) => {
     console.error("[message/edit]", err);
     res.status(500).json({ error: err.message || "Edit failed" });
   }
+});
+
+messageRouter.get("/contacts", (req: Request, res: Response) => {
+  const shopId = String(req.query.shop_id || "");
+  if (!shopId) return res.status(400).json({ error: "Missing shop_id" });
+  const session = getSession(shopId);
+  if (!session) return res.status(404).json({ error: "Session not connected" });
+  res.json({ ok: true, contacts: session.listPushNames() });
 });
 
 /**

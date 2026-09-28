@@ -372,6 +372,8 @@ export class Session {
         const phoneJid = c.phoneNumber || (!id.includes("@lid") ? id : "");
         const lidJid = c.lid || (id.includes("@lid") ? id : "");
         const phone = this.phoneFromPn(phoneJid);
+        const profileName = c.notify || c.verifiedName || c.name || "";
+        if (phone && profileName) void this.rememberPushName(phone, profileName);
         if (lidJid && phone) {
           void this.persistLidPn(lidJid.includes("@") ? lidJid : `${jidUserDigits(lidJid)}@lid`, phone);
           void this.migrateStoredPhone(jidUserDigits(lidJid), phone);
@@ -380,6 +382,9 @@ export class Session {
     };
     sock.ev.on("contacts.upsert", onContacts);
     sock.ev.on("contacts.update", onContacts);
+    sock.ev.on("messaging-history.set", ({ contacts }) => {
+      if (contacts?.length) onContacts(contacts);
+    });
 
     sock.ev.on("lid-mapping.update" as any, (pair: { pn?: string; lid?: string }) => {
       const phone = this.phoneFromPn(pair?.pn);
@@ -786,6 +791,7 @@ export class Session {
         { shop_id: shopId, phone_number: phone, bot_active: true },
         { onConflict: "shop_id,phone_number", ignoreDuplicates: true },
       );
+      await this.rememberPushName(phone, msg.pushName || (msg as { verifiedBizName?: string }).verifiedBizName);
 
       const row: Record<string, unknown> = { shop_id: shopId, phone_number: phone, role: "user", content: textContent };
       if (msgId) row.wa_message_id = msgId;
@@ -1180,6 +1186,69 @@ export class Session {
       }),
     );
     return { id: sent?.key?.id || "" };
+  }
+
+  async sendFile(
+    phone: string,
+    kind: "document" | "video",
+    fileUrl: string,
+    mimetype: string,
+    fileName: string,
+  ): Promise<{ id: string }> {
+    if (!this.sock) throw new Error("Session not connected");
+    const jid = this.toJid(phone);
+    const res = await fetch(fileUrl);
+    if (!res.ok) throw new Error(`Failed to fetch file: ${res.status}`);
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const sent = await this.trackBridgeSend(jid, () =>
+      kind === "video"
+        ? this.sock!.sendMessage(jid, { video: buffer, mimetype: mimetype || "video/mp4" })
+        : this.sock!.sendMessage(jid, {
+            document: buffer,
+            mimetype: mimetype || "application/octet-stream",
+            fileName: fileName || "file",
+          }),
+    );
+    return { id: sent?.key?.id || "" };
+  }
+
+  private pushNames = new Map<string, string>();
+
+  listPushNames(): Array<{ phone: string; name: string }> {
+    const extra = (this.sock as { store?: { contacts?: Record<string, Contact> } } | null)?.store?.contacts;
+    if (extra) {
+      for (const c of Object.values(extra)) {
+        const phone = this.phoneFromPn(c.phoneNumber || c.id);
+        const name = String(c.notify || c.verifiedName || c.name || "").trim();
+        if (phone && name && !/^\+?\d[\d\s-]{6,}$/.test(name)) this.pushNames.set(phone, name);
+      }
+    }
+    return [...this.pushNames.entries()].map(([phone, name]) => ({ phone, name }));
+  }
+
+  private async rememberPushName(phone: string, raw: string | null | undefined): Promise<void> {
+    const name = String(raw || "").replace(/\s+/g, " ").trim().slice(0, 80);
+    if (!name || /^\+?\d[\d\s-]{6,}$/.test(name)) return;
+    this.pushNames.set(phone, name);
+    const sb = getSupabase();
+    const shopId = this.info.shopId;
+    const { data, error } = await sb
+      .from("customers")
+      .update({ wa_push_name: name })
+      .eq("shop_id", shopId)
+      .eq("phone_number", phone)
+      .select("phone_number");
+    if (error && !/wa_push_name/.test(error.message)) {
+      console.warn(`[session ${shopId}] push name save failed:`, error.message);
+      return;
+    }
+    if (data && data.length) return;
+    const digits = phone.replace(/\D/g, "");
+    const { data: rows } = await sb.from("customers").select("phone_number").eq("shop_id", shopId);
+    const match = (rows as Array<{ phone_number?: string }> | null)?.find((row) => String(row.phone_number || "").replace(/\D/g, "") === digits);
+    if (match?.phone_number) {
+      await sb.from("customers").update({ wa_push_name: name }).eq("shop_id", shopId).eq("phone_number", match.phone_number);
+    }
   }
 
   async editMessage(waMessageId: string, phone: string, newText: string): Promise<void> {

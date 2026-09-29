@@ -39,6 +39,20 @@ const STORAGE_BUCKET = "product-images";
 
 const logger = pino({ level: process.env.LOG_LEVEL || "warn" });
 
+const DELIVERY_RANK: Record<string, number> = { sent: 1, delivered: 2, read: 3 };
+
+function statusToDelivery(status: number): "sent" | "delivered" | "read" | null {
+  if (status === proto.WebMessageInfo.Status.SERVER_ACK) return "sent";
+  if (status === proto.WebMessageInfo.Status.DELIVERY_ACK) return "delivered";
+  if (
+    status === proto.WebMessageInfo.Status.READ ||
+    status === proto.WebMessageInfo.Status.PLAYED
+  ) {
+    return "read";
+  }
+  return null;
+}
+
 // ─── Media Helpers ───────────────────────────────────────────────────────────
 
 function extForMime(mime: string): string {
@@ -211,6 +225,99 @@ export class Session {
     return digits;
   }
 
+  private async applyDeliveryStatus(
+    waId: string,
+    next: "sent" | "delivered" | "read",
+  ): Promise<void> {
+    if (!waId) return;
+    try {
+      const sb = getSupabase();
+      const { data } = await sb
+        .from("messages")
+        .select("id, delivery_status")
+        .eq("shop_id", this.info.shopId)
+        .eq("wa_message_id", waId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (!data?.id) return;
+      const cur = String(data.delivery_status || "");
+      if ((DELIVERY_RANK[next] || 0) <= (DELIVERY_RANK[cur] || 0)) return;
+      const { error } = await sb
+        .from("messages")
+        .update({ delivery_status: next })
+        .eq("id", data.id);
+      if (error) {
+        console.warn(`[session ${this.info.shopId}] delivery_status ${next} failed:`, error.message);
+      }
+    } catch (e) {
+      console.warn(`[session ${this.info.shopId}] delivery_status update error:`, e);
+    }
+  }
+
+  /** Link a just-sent WhatsApp id onto the dashboard row so ticks can update. */
+  private async attachOutgoingWaId(
+    phone: string,
+    waId: string,
+    contentHint?: string | null,
+  ): Promise<void> {
+    if (!waId) return;
+    const digits = String(phone || "").replace(/\D/g, "");
+    try {
+      const sb = getSupabase();
+      const shopId = this.info.shopId;
+      if (contentHint) {
+        const { data } = await sb
+          .from("messages")
+          .select("id")
+          .eq("shop_id", shopId)
+          .eq("phone_number", digits)
+          .in("role", ["model", "admin"])
+          .eq("content", contentHint)
+          .is("wa_message_id", null)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (data?.id) {
+          await sb
+            .from("messages")
+            .update({ wa_message_id: waId, delivery_status: "sent" })
+            .eq("id", data.id);
+          return;
+        }
+      }
+      const hint = String(contentHint || "");
+      const allowPending =
+        Boolean(hint) &&
+        !/^https?:\/\//i.test(hint) &&
+        !hint.includes("wa-media:");
+      if (allowPending) {
+        const since = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+        const { data: pending } = await sb
+          .from("messages")
+          .select("id")
+          .eq("shop_id", shopId)
+          .eq("phone_number", digits)
+          .in("role", ["model", "admin"])
+          .is("wa_message_id", null)
+          .gte("created_at", since)
+          .order("created_at", { ascending: true })
+          .limit(1)
+          .maybeSingle();
+        if (pending?.id) {
+          await sb
+            .from("messages")
+            .update({ wa_message_id: waId, delivery_status: "sent" })
+            .eq("id", pending.id);
+          return;
+        }
+      }
+      await this.applyDeliveryStatus(waId, "sent");
+    } catch (e) {
+      console.warn(`[session ${this.info.shopId}] attachOutgoingWaId failed:`, e);
+    }
+  }
+
   private cacheMessage(id: string | null | undefined, message: proto.IMessage | null | undefined): void {
     if (!id || !message) return;
     this.recentMessages.set(id, message);
@@ -359,8 +466,29 @@ export class Session {
     });
     sock.ev.on("messages.update", (updates) => {
       for (const u of updates || []) {
-        if (!u?.update?.message || !u.key) continue;
-        this.dispatchWaMessage({ key: u.key, message: u.update.message } as WAMessage);
+        if (u?.update?.message && u.key) {
+          this.dispatchWaMessage({ key: u.key, message: u.update.message } as WAMessage);
+        }
+        const waId = u?.key?.id;
+        const st = u?.update?.status;
+        if (waId && u.key?.fromMe && typeof st === "number") {
+          const mapped = statusToDelivery(st);
+          if (mapped) void this.applyDeliveryStatus(waId, mapped);
+        }
+      }
+    });
+    sock.ev.on("message-receipt.update", (updates) => {
+      for (const u of updates || []) {
+        const waId = u?.key?.id;
+        if (!waId || u.key?.fromMe === false) continue;
+        const r = u.receipt;
+        const mapped =
+          r?.readTimestamp || r?.playedTimestamp
+            ? "read"
+            : r?.receiptTimestamp
+              ? "delivered"
+              : null;
+        if (mapped) void this.applyDeliveryStatus(waId, mapped);
       }
     });
 
@@ -977,7 +1105,13 @@ export class Session {
       { onConflict: "shop_id,phone_number", ignoreDuplicates: true },
     );
 
-    const row: Record<string, unknown> = { shop_id: shopId, phone_number: phone, role: "admin", content: textContent };
+      const row: Record<string, unknown> = {
+      shop_id: shopId,
+      phone_number: phone,
+      role: "admin",
+      content: textContent,
+      delivery_status: "sent",
+    };
     if (msgId) row.wa_message_id = msgId;
     await sb.from("messages").insert(row);
     // Deliberately no triggerBot call — an owner's manual message must never
@@ -1120,7 +1254,9 @@ export class Session {
     
     console.log(`[send] text to ${jid} (from ${phone})`);
     const sent = await this.trackBridgeSend(jid, () => this.sock!.sendMessage(jid, { text: message }));
-    return { id: sent?.key?.id || "" };
+    const id = sent?.key?.id || "";
+    void this.attachOutgoingWaId(phone, id, message);
+    return { id };
   }
 
   async sendImage(phone: string, imageUrl: string, caption?: string, showTyping: boolean = true): Promise<{ id: string }> {
@@ -1141,13 +1277,17 @@ export class Session {
       const sent = await this.trackBridgeSend(jid, () =>
         this.sock!.sendMessage(jid, { image: buffer, caption: caption || undefined }),
       );
-      return { id: sent?.key?.id || "" };
+      const id = sent?.key?.id || "";
+      void this.attachOutgoingWaId(phone, id, imageUrl);
+      return { id };
     } catch (err) {
       console.error(`[session ${this.info.shopId}] sendImage fetch failed, falling back to url mode:`, err);
       const sent = await this.trackBridgeSend(jid, () =>
         this.sock!.sendMessage(jid, { image: { url: imageUrl }, caption: caption || undefined }),
       );
-      return { id: sent?.key?.id || "" };
+      const id = sent?.key?.id || "";
+      void this.attachOutgoingWaId(phone, id, imageUrl);
+      return { id };
     }
   }
 
@@ -1185,7 +1325,9 @@ export class Session {
         ptt: true,
       }),
     );
-    return { id: sent?.key?.id || "" };
+    const id = sent?.key?.id || "";
+    void this.attachOutgoingWaId(phone, id, audio.url);
+    return { id };
   }
 
   async sendFile(
@@ -1209,7 +1351,9 @@ export class Session {
             fileName: fileName || "file",
           }),
     );
-    return { id: sent?.key?.id || "" };
+    const id = sent?.key?.id || "";
+    void this.attachOutgoingWaId(phone, id, fileUrl);
+    return { id };
   }
 
   private pushNames = new Map<string, string>();

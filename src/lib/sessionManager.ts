@@ -17,6 +17,19 @@ import * as path from "path";
 import * as fs from "fs";
 import * as QRCode from "qrcode";
 import { getSupabase } from "./supabase.js";
+import { AB, SendBlockedError, SendGuard } from "./antiBan.js";
+
+export { SendBlockedError } from "./antiBan.js";
+
+/** Per-call options for outbound sends. */
+export interface SendOpts {
+  /** Longest this call may wait in the pacing queue before giving up (ms). */
+  maxWaitMs?: number;
+}
+/** Bot/queue sends can wait a while; HTTP callers pass a shorter value. */
+const DEFAULT_SEND_WAIT_MS = 60_000;
+/** Hard cap on text bubbles per bot turn (a runaway model must not flood a chat). */
+const MAX_BOT_BUBBLES = 8;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -76,6 +89,60 @@ function jidUserDigits(jid: string | null | undefined): string {
   return String(jid || "").split("@")[0].split(":")[0].replace(/\D/g, "");
 }
 
+// ─── Concurrency / timeout helpers ───────────────────────────────────────────
+
+/** Resolve with `p`'s value, or `fallback` if it has not settled within `ms`.
+ *  Never rejects. Used so a slow database can't stall connection handling. */
+function withTimeout<T>(p: PromiseLike<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve) => {
+    const timer = setTimeout(() => resolve(fallback), ms);
+    Promise.resolve(p).then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      () => { clearTimeout(timer); resolve(fallback); },
+    );
+  });
+}
+
+/** Tiny FIFO limiter: at most `concurrency` jobs run at once, the rest queue. */
+function createLimiter(concurrency: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
+  const pump = () => {
+    while (active < concurrency && queue.length) {
+      const job = queue.shift()!;
+      active++;
+      job();
+    }
+  };
+  return function limit<T>(fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      queue.push(() => {
+        Promise.resolve()
+          .then(fn)
+          .then(resolve, reject)
+          .finally(() => { active--; pump(); });
+      });
+      pump();
+    });
+  };
+}
+
+/** Process-wide cap on background contact-sync DB work. A freshly paired
+ *  number can deliver thousands of contacts at once; without this each one
+ *  fired its own concurrent Supabase queries and starved every other business. */
+const contactSyncLimit = createLimiter(3);
+
+/** Max time to wait for an image/audio/file download before giving up. */
+const MEDIA_FETCH_TIMEOUT_MS = 15_000;
+/** Bot HTTP call: the frontend route may run up to 60s (maxDuration), so wait a bit longer. */
+const BOT_FETCH_TIMEOUT_MS = 65_000;
+/** Pauses before retry #1 and #2 when the bot endpoint fails fast (network error / 5xx / 429). */
+const BOT_RETRY_DELAYS_MS = [2000, 5000];
+/** Safety net: a single customer turn (AI call + typed replies) must never hold its chat queue longer than this. */
+const BOT_TURN_WATCHDOG_MS = 240_000;
+/** How many customers of ONE business may have a bot turn running at once. The rest wait their turn. */
+const BOT_MAX_CONCURRENT_PER_SESSION = Math.max(1, Number(process.env.BOT_MAX_CONCURRENT_PER_SESSION) || 4);
+
 async function uploadInboundMedia(shopId: string, buffer: Buffer, mime: string): Promise<string | null> {
   try {
     const sb = getSupabase();
@@ -108,6 +175,29 @@ export class Session {
   private authDir: string;
   private saveCreds: (() => Promise<void>) | null = null;
   private reconnecting = false;
+  // Consecutive reconnects since the socket last reached a healthy state
+  // (QR shown or connection open). Drives exponential backoff.
+  private reconnectAttempts = 0;
+  // Set when this Session object is deliberately discarded (closeSocket/destroy).
+  // Ending the socket fires a 'close' event; without this guard that event would
+  // schedule a reconnect on the discarded object and it would fight the
+  // replacement Session for the same credentials.
+  private stopped = false;
+  // Anti-ban: pacing, caps, warm-up, opt-out and circuit breaker for this number.
+  readonly guard: SendGuard;
+  // True when the first connect() of this Session started from unregistered
+  // credentials (i.e. a brand-new QR/pairing) — that starts the warm-up clock.
+  private wasUnpaired = false;
+  // Consecutive "this number is being rejected" closes (403/411/500).
+  private fatalStrikes = 0;
+  // Last inbound message key per customer so we can mark it read before replying.
+  private lastInboundKey = new Map<string, { key: WAMessageKey; at: number }>();
+  private proactiveQueue: Array<{ phone: string; text: string }> = [];
+  private proactiveDraining = false;
+  private proactiveTimer: ReturnType<typeof setTimeout> | null = null;
+  private proactiveWake: (() => void) | null = null;
+  private lidMapTimer: ReturnType<typeof setTimeout> | null = null;
+  private chatJidTimer: ReturnType<typeof setTimeout> | null = null;
   private processedMsgIds = new Set<string>();
   // Remember the exact jid a phone number last messaged from (handles @lid
   // contacts that can only be reached via their lid jid, not phone@s.whatsapp.net).
@@ -142,6 +232,8 @@ export class Session {
     this.lidMapPath = path.join(this.authDir, "lid-map.json");
     this.chatJidPath = path.join(this.authDir, "chat-jids.json");
     if (!fs.existsSync(this.authDir)) fs.mkdirSync(this.authDir, { recursive: true });
+    this.guard = new SendGuard(shopId, path.join(this.authDir, "antiban.json"));
+    this.guard.load();
   }
 
   // ─── LID ↔ phone map (persisted) ─────────────────────────────────────────
@@ -162,7 +254,22 @@ export class Session {
     }
   }
 
+  /** Schedule a coalesced write. Mappings arrive in bursts (thousands during
+   *  the first contact sync); writing the whole file synchronously for each
+   *  one blocked the shared event loop and froze every business. */
   private saveLidMap(): void {
+    if (!this.lidMapDirty || this.lidMapTimer) return;
+    this.lidMapTimer = setTimeout(() => {
+      this.lidMapTimer = null;
+      this.flushLidMap();
+    }, 2000);
+  }
+
+  private flushLidMap(): void {
+    if (this.lidMapTimer) {
+      clearTimeout(this.lidMapTimer);
+      this.lidMapTimer = null;
+    }
     if (!this.lidMapDirty) return;
     this.lidMapDirty = false;
     try {
@@ -188,6 +295,18 @@ export class Session {
   }
 
   private saveChatJids(): void {
+    if (!this.chatJidDirty || this.chatJidTimer) return;
+    this.chatJidTimer = setTimeout(() => {
+      this.chatJidTimer = null;
+      this.flushChatJids();
+    }, 2000);
+  }
+
+  private flushChatJids(): void {
+    if (this.chatJidTimer) {
+      clearTimeout(this.chatJidTimer);
+      this.chatJidTimer = null;
+    }
     if (!this.chatJidDirty) return;
     this.chatJidDirty = false;
     try {
@@ -197,6 +316,16 @@ export class Session {
     } catch (e: any) {
       console.warn(`[session ${this.info.shopId}] failed to save chat jids:`, e?.message || e);
     }
+  }
+
+  /** Drop pending debounced writes (used when the auth dir is being wiped). */
+  private cancelPendingSaves(): void {
+    this.guard.cancel();
+    this.stopProactive();
+    if (this.lidMapTimer) { clearTimeout(this.lidMapTimer); this.lidMapTimer = null; }
+    if (this.chatJidTimer) { clearTimeout(this.chatJidTimer); this.chatJidTimer = null; }
+    this.lidMapDirty = false;
+    this.chatJidDirty = false;
   }
 
   /** Remember the outbound jid for a phone. Real mobiles stay on @s.whatsapp.net.
@@ -427,6 +556,9 @@ export class Session {
 
     const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
     this.saveCreds = saveCreds;
+    // Sticky: once true it stays true for this Session (the post-scan restart
+    // reconnects with registered creds, but it is still a brand-new number).
+    if (!state.creds.registered) this.wasUnpaired = true;
 
     const sock = makeWASocket({
       logger,
@@ -501,10 +633,23 @@ export class Session {
         const lidJid = c.lid || (id.includes("@lid") ? id : "");
         const phone = this.phoneFromPn(phoneJid);
         const profileName = c.notify || c.verifiedName || c.name || "";
-        if (phone && profileName) void this.rememberPushName(phone, profileName);
+        // Bulk syncs (first scan, reconnects) can carry thousands of contacts.
+        // Push them through a process-wide limiter so they can't flood
+        // Supabase or starve other businesses' live traffic.
+        if (phone && profileName) {
+          void contactSyncLimit(() => this.rememberPushName(phone, profileName, true)).catch(() => {});
+        }
         if (lidJid && phone) {
-          void this.persistLidPn(lidJid.includes("@") ? lidJid : `${jidUserDigits(lidJid)}@lid`, phone);
-          void this.migrateStoredPhone(jidUserDigits(lidJid), phone);
+          const lidDigits = jidUserDigits(lidJid);
+          // A mapping we already knew was migrated when first learned; redoing
+          // the 3-query migration for every contact on each resync is what
+          // hammered the database after reconnects. Compute BEFORE
+          // persistLidPn, which records the mapping synchronously.
+          const alreadyMapped = this.lidToPhone.get(lidDigits) === phone;
+          void this.persistLidPn(lidJid.includes("@") ? lidJid : `${lidDigits}@lid`, phone);
+          if (!alreadyMapped) {
+            void contactSyncLimit(() => this.migrateStoredPhone(lidDigits, phone)).catch(() => {});
+          }
         }
       }
     };
@@ -557,6 +702,8 @@ export class Session {
       try {
         this.info.qrCode = await QRCode.toDataURL(qr);
         this.info.status = "qr";
+        // The socket reached WhatsApp fine; keep QR refresh cycles fast.
+        this.reconnectAttempts = 0;
       } catch (err) {
         console.error(`[session ${this.info.shopId}] QR encode error:`, err);
       }
@@ -566,6 +713,9 @@ export class Session {
       this.info.status = "connected";
       this.info.qrCode = null;
       this.info.pairingCode = null;
+      this.reconnectAttempts = 0;
+      this.fatalStrikes = 0;
+      this.guard.onConnectionOpen(this.wasUnpaired);
       try {
         const me = this.sock?.authState?.creds?.me as { id?: string; jid?: string; phoneNumber?: string } | undefined;
         const id = me?.id || this.sock?.user?.id || "";
@@ -589,10 +739,37 @@ export class Session {
       const loggedOut = statusCode === DisconnectReason.loggedOut;
       const timedOut = statusCode === DisconnectReason.timedOut || statusCode === 515;
 
+      // These codes mean WhatsApp itself is refusing this login: another
+      // connection took the session over (440), or the number/session is being
+      // rejected (403 / 411 / 500). Retrying in a loop only makes it worse —
+      // two instances fighting over one login is a well-known way to get a
+      // number flagged, and a restricted number must not be hammered. Stop
+      // reconnecting and surface it; the credentials are kept, so the owner can
+      // resume from the dashboard once the cause is fixed.
+      const replaced = statusCode === DisconnectReason.connectionReplaced;
+      const rejected =
+        statusCode === DisconnectReason.forbidden ||
+        statusCode === DisconnectReason.multideviceMismatch ||
+        statusCode === DisconnectReason.badSession;
+      if (!loggedOut && (replaced || (rejected && ++this.fatalStrikes >= 3))) {
+        this.stopped = true;
+        this.stopProactive();
+        this.guard.flush();
+        this.info.status = "disconnected";
+        console.error(
+          `[session ${this.info.shopId}] STOPPED — WhatsApp closed the connection with code ${statusCode} ` +
+            `(${replaced ? "the login was taken over by another connection; make sure only one bridge uses this number" : "the login was rejected; check the number in WhatsApp"}). ` +
+            `Not reconnecting automatically — reconnect from the dashboard once resolved.`,
+        );
+        void this.markConnected(false);
+        return;
+      }
+
       if (loggedOut) {
         this.info.status = "disconnected";
         await this.markConnected(false);
         console.log(`[session ${this.info.shopId}] logged out — clearing auth`);
+        this.cancelPendingSaves();
         try {
           fs.rmSync(this.authDir, { recursive: true, force: true });
           fs.mkdirSync(this.authDir, { recursive: true });
@@ -604,15 +781,10 @@ export class Session {
       if (timedOut) {
         console.warn(`[session ${this.info.shopId}] connection timed out — reconnecting with existing auth`);
         this.info.status = "connecting";
-        await this.markConnected(false);
+        // Fire-and-forget: a slow database must never delay the reconnect.
+        void this.markConnected(false);
         
-        if (!this.reconnecting) {
-          this.reconnecting = true;
-          setTimeout(() => {
-            this.reconnecting = false;
-            this.connect().catch((e) => console.error(`[session ${this.info.shopId}] reconnect failed:`, e));
-          }, 5000); // Wait 5 seconds before reconnecting
-        }
+        this.scheduleReconnect(5000); // first retry after 5s, then backs off
         return;
       }
 
@@ -624,17 +796,41 @@ export class Session {
       // UI on the QR screen even though the bridge goes on to connect
       // successfully a few seconds later.
       this.info.status = "connecting";
-      await this.markConnected(false);
+      // Fire-and-forget: a slow database must never delay the reconnect.
+      void this.markConnected(false);
 
       if (!this.reconnecting) {
-        this.reconnecting = true;
         console.warn(`[session ${this.info.shopId}] connection closed (reconnecting) — reason: ${statusCode ?? "unknown"}`);
-        setTimeout(() => {
-          this.reconnecting = false;
-          this.connect().catch((e) => console.error(`[session ${this.info.shopId}] reconnect failed:`, e));
-        }, 3000);
       }
+      this.scheduleReconnect(3000); // first retry after 3s, then backs off
     }
+  }
+
+  /** Reconnect with exponential backoff (base, 2x, 4x ... capped at 60s).
+   *  Resets once the socket shows a QR or opens. If connect() itself throws
+   *  (e.g. a disk error) no 'close' event will ever arrive, so retry here
+   *  instead of leaving the session stuck on "connecting" forever. */
+  private scheduleReconnect(baseMs: number): void {
+    if (this.reconnecting || this.stopped) return;
+    this.reconnecting = true;
+    const delay = Math.min(baseMs * 2 ** this.reconnectAttempts, 60_000);
+    this.reconnectAttempts = Math.min(this.reconnectAttempts + 1, 10);
+    setTimeout(() => {
+      this.reconnecting = false;
+      if (this.stopped) return;
+      this.connect().catch((e) => {
+        console.error(`[session ${this.info.shopId}] reconnect failed:`, e);
+        this.scheduleReconnect(baseMs);
+      });
+    }, delay);
+  }
+
+  /** Initial connect that keeps retrying if it throws before any socket exists. */
+  startConnect(): void {
+    this.connect().catch((e) => {
+      console.error(`[session ${this.info.shopId}] connect failed:`, e?.message || e);
+      this.scheduleReconnect(3000);
+    });
   }
 
   private dispatchWaMessage(msg: WAMessage): void {
@@ -670,7 +866,15 @@ export class Session {
   ): Promise<T> {
     this.pendingBridgeSends.set(jid, (this.pendingBridgeSends.get(jid) || 0) + 1);
     try {
-      const result = await fn();
+      let result: T;
+      try {
+        result = await fn();
+        this.guard.recordSuccess();
+      } catch (err) {
+        // Feeds the circuit breaker (connectivity blips are ignored there).
+        this.guard.recordFailure(err);
+        throw err;
+      }
       const sent = result as { key?: { id?: string | null }; message?: proto.IMessage } | null | undefined;
       const id = sent?.key?.id || "";
       if (id) {
@@ -915,6 +1119,16 @@ export class Session {
 
       if (!textContent) return;
 
+      // Anti-ban bookkeeping: this person wrote to us (makes them eligible for
+      // follow-ups, and lets us honour "stop"), and remember the message key so
+      // the bot can mark it read before replying, like a human would.
+      this.guard.noteInbound(phone, isMedia ? "" : textContent);
+      this.lastInboundKey.set(phone, { key: msg.key, at: Date.now() });
+      if (this.lastInboundKey.size > 500) {
+        const oldest = this.lastInboundKey.keys().next().value;
+        if (oldest !== undefined) this.lastInboundKey.delete(oldest);
+      }
+
       await sb.from("customers").upsert(
         { shop_id: shopId, phone_number: phone, bot_active: true },
         { onConflict: "shop_id,phone_number", ignoreDuplicates: true },
@@ -1120,7 +1334,78 @@ export class Session {
 
   // ─── Bot Trigger ─────────────────────────────────────────────────────────
 
-  private async triggerBot(shopId: string, phone: string, text: string, mediaType: "audio" | "image" | "document" | null, mediaUrl: string | null, messageId: string | null = null): Promise<void> {
+  // Per-chat FIFO: a customer's second message is answered only after the first
+  // reply has been fully sent. Otherwise two parallel bot runs both saw the same
+  // history and produced duplicate/contradictory replies (or two orders).
+  private botChains = new Map<string, Promise<void>>();
+  // Per-session cap on simultaneous bot turns (slot hand-off semaphore).
+  private botActive = 0;
+  private botWaiters: Array<() => void> = [];
+
+  private async acquireBotSlot(): Promise<void> {
+    if (this.botActive < BOT_MAX_CONCURRENT_PER_SESSION) {
+      this.botActive++;
+      return;
+    }
+    // releaseBotSlot() hands its slot straight to us, so the count stays correct.
+    await new Promise<void>((resolve) => this.botWaiters.push(resolve));
+  }
+
+  private releaseBotSlot(): void {
+    const next = this.botWaiters.shift();
+    if (next) next();
+    else this.botActive = Math.max(0, this.botActive - 1);
+  }
+
+  /** Queue a bot turn for this customer. Same signature/behavior as before for
+   *  callers; the turn just runs in order and within the concurrency cap. */
+  private triggerBot(shopId: string, phone: string, text: string, mediaType: "audio" | "image" | "document" | null, mediaUrl: string | null, messageId: string | null = null): Promise<void> {
+    const key = `${shopId}:${phone}`;
+    const prev = this.botChains.get(key) ?? Promise.resolve();
+    const run = prev.then(async () => {
+      await this.acquireBotSlot();
+      try {
+        await withTimeout(this.runBotTurn(shopId, phone, text, mediaType, mediaUrl, messageId), BOT_TURN_WATCHDOG_MS, undefined);
+      } finally {
+        this.releaseBotSlot();
+      }
+    });
+    const tail = run.catch(() => {});
+    this.botChains.set(key, tail);
+    void tail.then(() => {
+      if (this.botChains.get(key) === tail) this.botChains.delete(key);
+    });
+    return run;
+  }
+
+  /** POST to the frontend bot. Retries only when the endpoint fails FAST
+   *  (connection error, 5xx, 429). A timeout is never retried: the original
+   *  request may still be running server-side and a retry could double-reply. */
+  private async callBotWithRetry(url: string, secret: string, payload: Record<string, string>): Promise<Response | null> {
+    let res: Response | null = null;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        res = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-bridge-secret": secret },
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(BOT_FETCH_TIMEOUT_MS),
+        });
+        if (res.status < 500 && res.status !== 429) return res;
+        console.warn(`[bot] endpoint returned ${res.status} (attempt ${attempt + 1}) for ${payload.phone_number}`);
+      } catch (e) {
+        const timedOut = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
+        console.warn(`[bot] request failed (attempt ${attempt + 1}) for ${payload.phone_number}:`, (e as Error)?.message || e);
+        res = null;
+        if (timedOut) return null;
+      }
+      const delay = BOT_RETRY_DELAYS_MS[attempt];
+      if (delay === undefined) return res;
+      await sleep(delay);
+    }
+  }
+
+  private async runBotTurn(shopId: string, phone: string, text: string, mediaType: "audio" | "image" | "document" | null, mediaUrl: string | null, messageId: string | null = null): Promise<void> {
     const frontendUrl = process.env.FRONTEND_URL?.trim();
     const bridgeSecret = process.env.BRIDGE_SECRET?.trim() || "";
     if (!frontendUrl) return;
@@ -1135,12 +1420,8 @@ export class Session {
         payload.media_url = mediaUrl;
       }
 
-      const res = await fetch(`${frontendUrl}/api/wa-web-bot`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-bridge-secret": bridgeSecret },
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(45000), // 45 second timeout to prevent hanging
-      });
+      const res = await this.callBotWithRetry(`${frontendUrl}/api/wa-web-bot`, bridgeSecret, payload);
+      if (!res) return;
 
       const data = (await res.json().catch(() => ({}))) as {
         ok?: boolean;
@@ -1151,6 +1432,10 @@ export class Session {
       };
 
       if (!res.ok || !data?.ok) return;
+
+      // Nothing to send (paused bot, duplicate, quota…) — don't mark as read.
+      const hasOutput = (data.bubbles || []).some((b) => b.trim()) || (data.images || []).length > 0 || (data.audios || []).length > 0;
+      if (hasOutput) await this.markReadBeforeReply(phone);
 
       // Small random delay before starting to send (simulates bot "thinking")
       await randomDelay(800, 1500);
@@ -1176,7 +1461,7 @@ export class Session {
       }
 
       // Send text bubbles with typing indicators and random delays
-      for (const b of data.bubbles || []) {
+      for (const b of (data.bubbles || []).slice(0, MAX_BOT_BUBBLES)) {
         if (!b.trim()) continue;
         try {
           await this.sendText(phone, b); // Typing indicator built-in (based on message length)
@@ -1242,13 +1527,153 @@ export class Session {
     }
   }
 
-  async sendText(phone: string, message: string, showTyping: boolean = true): Promise<{ id: string }> {
+  /** Enforce anti-ban caps + pacing for one outbound message. Throws SendBlockedError. */
+  private async reserveSend(phone: string, opts?: SendOpts): Promise<void> {
+    await this.guard.reserveSend(phone, opts?.maxWaitMs ?? DEFAULT_SEND_WAIT_MS);
+  }
+
+  /** Mark the customer's latest message as read (once), just before we answer. */
+  private async markReadBeforeReply(phone: string): Promise<void> {
+    if (!AB.enabled || !AB.markRead || !this.sock) return;
+    const entry = this.lastInboundKey.get(phone);
+    if (!entry) return;
+    this.lastInboundKey.delete(phone);
+    if (Date.now() - entry.at > 10 * 60_000) return; // stale — don't mark old chats read
+    try {
+      await this.sock.readMessages([entry.key]);
+    } catch (e) {
+      console.warn(`[session ${this.info.shopId}] mark-read failed:`, (e as Error)?.message || e);
+    }
+  }
+
+  // ─── Proactive (follow-up) messages ──────────────────────────────────────
+  // Anything NOT sent in direct response to a customer message (e.g. "still
+  // interested?" reminders) goes through here instead of being sent at once.
+  // It is the highest-risk traffic for a ban, so it is slow, limited to people
+  // who wrote to us recently, kept inside business hours, capped per day by how
+  // old the number is, and re-checked right before each send.
+
+  /** When this customer last wrote to us: local record first, then the database. */
+  private async lastInboundFor(phone: string): Promise<number | null> {
+    const local = this.guard.lastInboundAt(phone);
+    if (local) return local;
+    try {
+      const res = await withTimeout(
+        getSupabase()
+          .from("messages")
+          .select("created_at")
+          .eq("shop_id", this.info.shopId)
+          .eq("phone_number", phone)
+          .eq("role", "user")
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+        5000,
+        null,
+      );
+      const iso = (res as { data?: { created_at?: string } | null } | null)?.data?.created_at;
+      const ts = iso ? Date.parse(iso) : NaN;
+      if (Number.isFinite(ts)) {
+        this.guard.seedInbound(phone, ts);
+        return ts;
+      }
+    } catch {
+      /* fall through */
+    }
+    return null;
+  }
+
+  /**
+   * Accept a proactive text for slow, guarded delivery. Throws SendBlockedError
+   * (check `.permanent`) when it must not be sent. Resolves as soon as it is queued.
+   */
+  async queueProactive(phone: string, text: string): Promise<{ queued: true; position: number }> {
+    const digits = phone.replace(/\D/g, "");
+    if (!digits) throw new Error("Invalid phone number");
+    if (AB.enabled) {
+      await this.lastInboundFor(digits);
+      this.guard.checkProactive(digits, this.proactiveQueue.length);
+      if (this.proactiveQueue.some((q) => q.phone === digits)) {
+        throw new SendBlockedError("duplicate", "Already queued for this customer", undefined, true);
+      }
+    }
+    this.proactiveQueue.push({ phone: digits, text });
+    void this.drainProactive();
+    return { queued: true, position: this.proactiveQueue.length };
+  }
+
+  /** Sleep that can be cut short when the session shuts down. */
+  private proactiveSleep(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const done = () => {
+        if (this.proactiveTimer) clearTimeout(this.proactiveTimer);
+        this.proactiveTimer = null;
+        this.proactiveWake = null;
+        resolve();
+      };
+      this.proactiveWake = done;
+      this.proactiveTimer = setTimeout(done, ms);
+    });
+  }
+
+  private stopProactive(): void {
+    this.proactiveQueue.length = 0;
+    this.proactiveWake?.();
+  }
+
+  private async drainProactive(): Promise<void> {
+    if (this.proactiveDraining) return;
+    this.proactiveDraining = true;
+    try {
+      let first = true;
+      while (this.proactiveQueue.length && !this.stopped) {
+        if (this.info.status !== "connected" || !this.sock) {
+          await this.proactiveSleep(30_000);
+          continue;
+        }
+        if (AB.enabled && (!this.guard.inProactiveHours() || !this.guard.proactiveHourHasRoom())) {
+          await this.proactiveSleep(5 * 60_000);
+          continue;
+        }
+        // Space these out like a person would — never back-to-back.
+        await this.proactiveSleep(first ? 5_000 + Math.random() * 10_000 : this.guard.randomProactiveGapMs());
+        first = false;
+        if (this.stopped) break;
+        const item = this.proactiveQueue.shift();
+        if (!item) break;
+
+        // Conditions may have changed while it waited (opt-out, quota, breaker…).
+        const blocked = AB.enabled ? this.guard.canSendProactiveNow(item.phone) : null;
+        if (blocked) {
+          console.log(`[session ${this.info.shopId}] dropped queued follow-up to ${item.phone}: ${blocked.code}`);
+          continue;
+        }
+        try {
+          await this.sendText(item.phone, item.text, true, { maxWaitMs: DEFAULT_SEND_WAIT_MS });
+          this.guard.noteProactiveSent(item.phone);
+        } catch (e) {
+          console.warn(`[session ${this.info.shopId}] follow-up to ${item.phone} failed:`, (e as Error)?.message || e);
+        }
+      }
+    } finally {
+      this.proactiveDraining = false;
+    }
+  }
+
+  getGuardSnapshot() {
+    return this.guard.snapshot(this.proactiveQueue.length);
+  }
+
+  async sendText(phone: string, message: string, showTyping: boolean = true, opts?: SendOpts): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
     const jid = this.toJid(phone);
-    
+
+    // Caps + pacing first, so the typing bubble is followed straight by the message.
+    await this.reserveSend(phone, opts);
+
     // Show typing indicator before sending (simulate human typing)
     if (showTyping) {
-      const typingDuration = Math.min(Math.max(message.length * 30, 800), 3000);
+      const typingDuration = Math.min(Math.max(message.length * 30, 800), 3000) + Math.floor(Math.random() * 500);
       await this.showTyping(phone, typingDuration);
     }
     
@@ -1259,9 +1684,10 @@ export class Session {
     return { id };
   }
 
-  async sendImage(phone: string, imageUrl: string, caption?: string, showTyping: boolean = true): Promise<{ id: string }> {
+  async sendImage(phone: string, imageUrl: string, caption?: string, showTyping: boolean = true, opts?: SendOpts): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
     const jid = this.toJid(phone);
+    await this.reserveSend(phone, opts);
     
     // Show typing indicator before sending image
     if (showTyping) {
@@ -1271,7 +1697,7 @@ export class Session {
     try {
       // Fetch the bytes ourselves — more reliable than letting Baileys fetch a
       // remote URL, which can fail silently on redirects/slow responses.
-      const res = await fetch(imageUrl);
+      const res = await fetch(imageUrl, { signal: AbortSignal.timeout(MEDIA_FETCH_TIMEOUT_MS) });
       if (!res.ok) throw new Error(`Failed to fetch image_url: ${res.status}`);
       const buffer = Buffer.from(await res.arrayBuffer());
       const sent = await this.trackBridgeSend(jid, () =>
@@ -1295,9 +1721,11 @@ export class Session {
     phone: string,
     audio: { url?: string; base64?: string; mimetype?: string },
     showTyping: boolean = true,
+    opts?: SendOpts,
   ): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
     const jid = this.toJid(phone);
+    await this.reserveSend(phone, opts);
 
     // Show typing indicator before sending audio
     if (showTyping) {
@@ -1311,7 +1739,7 @@ export class Session {
     if (audio.base64) {
       buffer = Buffer.from(audio.base64, "base64");
     } else if (audio.url) {
-      const res = await fetch(audio.url);
+      const res = await fetch(audio.url, { signal: AbortSignal.timeout(MEDIA_FETCH_TIMEOUT_MS) });
       if (!res.ok) throw new Error(`Failed to fetch audio_url: ${res.status}`);
       buffer = Buffer.from(await res.arrayBuffer());
     } else {
@@ -1336,10 +1764,12 @@ export class Session {
     fileUrl: string,
     mimetype: string,
     fileName: string,
+    opts?: SendOpts,
   ): Promise<{ id: string }> {
     if (!this.sock) throw new Error("Session not connected");
     const jid = this.toJid(phone);
-    const res = await fetch(fileUrl);
+    await this.reserveSend(phone, opts);
+    const res = await fetch(fileUrl, { signal: AbortSignal.timeout(MEDIA_FETCH_TIMEOUT_MS) });
     if (!res.ok) throw new Error(`Failed to fetch file: ${res.status}`);
     const buffer = Buffer.from(await res.arrayBuffer());
     const sent = await this.trackBridgeSend(jid, () =>
@@ -1370,10 +1800,15 @@ export class Session {
     return [...this.pushNames.entries()].map(([phone, name]) => ({ phone, name }));
   }
 
-  private async rememberPushName(phone: string, raw: string | null | undefined): Promise<void> {
+  /** `bulk` = called from a contact sync rather than a live message. Bulk calls
+   *  skip names we already stored and never fall back to loading every customer
+   *  of the shop (live messages keep the full, slower matching). */
+  private async rememberPushName(phone: string, raw: string | null | undefined, bulk = false): Promise<void> {
     const name = String(raw || "").replace(/\s+/g, " ").trim().slice(0, 80);
     if (!name || /^\+?\d[\d\s-]{6,}$/.test(name)) return;
+    const unchanged = this.pushNames.get(phone) === name;
     this.pushNames.set(phone, name);
+    if (bulk && unchanged) return;
     const sb = getSupabase();
     const shopId = this.info.shopId;
     const { data, error } = await sb
@@ -1387,6 +1822,7 @@ export class Session {
       return;
     }
     if (data && data.length) return;
+    if (bulk) return;
     const digits = phone.replace(/\D/g, "");
     const { data: rows } = await sb.from("customers").select("phone_number").eq("shop_id", shopId);
     const match = (rows as Array<{ phone_number?: string }> | null)?.find((row) => String(row.phone_number || "").replace(/\D/g, "") === digits);
@@ -1416,7 +1852,12 @@ export class Session {
 
   private async markConnected(connected: boolean): Promise<void> {
     try {
-      await getSupabase().from("businesses").update({ wa_web_connected: connected }).eq("id", this.info.shopId);
+      // Bounded: a hung Supabase call must not wedge whatever awaits this.
+      await withTimeout(
+        getSupabase().from("businesses").update({ wa_web_connected: connected }).eq("id", this.info.shopId),
+        5000,
+        null,
+      );
     } catch { /* ignore */ }
   }
 
@@ -1425,7 +1866,12 @@ export class Session {
    *  creds remain valid and the session reconnects automatically next boot,
    *  with no QR/pairing re-scan required. */
   async closeSocket(): Promise<void> {
-    this.saveLidMap();
+    this.stopped = true;
+    // Flush immediately — the debounced writer may still be holding changes.
+    this.flushLidMap();
+    this.flushChatJids();
+    this.guard.flush();
+    this.stopProactive();
     try { this.sock?.end(undefined as any); } catch { /* ignore */ }
     this.info.status = "disconnected";
     await this.markConnected(false);
@@ -1436,6 +1882,8 @@ export class Session {
    *  this for a genuine user-requested disconnect — after this, the business
    *  MUST re-scan a QR code / re-enter a pairing code to reconnect. */
   async destroy(): Promise<void> {
+    this.stopped = true;
+    this.cancelPendingSaves();
     try { await this.sock?.logout(); } catch { /* ignore */ }
     try { this.sock?.end(undefined as any); } catch { /* ignore */ }
     this.info.status = "disconnected";
@@ -1462,7 +1910,7 @@ export async function createSession(shopId: string, phoneForPairing?: string): P
 
   const session = new Session(shopId, phoneForPairing);
   sessions.set(shopId, session);
-  session.connect().catch((e) => console.error("[connect]", e));
+  session.startConnect();
   return session;
 }
 
@@ -1498,7 +1946,7 @@ export async function restoreSessions(): Promise<void> {
     try {
       const session = new Session(shopId);
       sessions.set(shopId, session);
-      session.connect().catch((e) => console.error(`[restore] ${shopId} connect failed:`, e?.message || e));
+      session.startConnect();
       // Stagger restores to avoid connecting many sockets at once.
       await sleep(1500);
     } catch (e: any) {

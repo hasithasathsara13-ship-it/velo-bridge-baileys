@@ -1149,13 +1149,40 @@ export class Session {
           messageId: msgId || null,
         });
       } else if (textForBot || mediaType) {
-        this.triggerBot(shopId, phone, textForBot, mediaType, mediaUrl, msgId || null).catch(
-          (e) => console.error("[bot]", e),
-        );
+        if (this.isRepeatedAutoText(phone, textForBot)) {
+          console.warn(`[bot] no AI call for ${phone}: the same long message arrived 3+ times in 30 min (likely another bot's auto-reply)`);
+        } else {
+          this.triggerBot(shopId, phone, textForBot, mediaType, mediaUrl, msgId || null).catch(
+            (e) => console.error("[bot]", e),
+          );
+        }
       }
     } finally {
       if (isMedia) this.endMediaBotBurst(shopId, phone);
     }
+  }
+
+  // Recent inbound texts per customer, to spot another bot's auto-reply loop.
+  private recentInboundTexts = new Map<string, Array<{ text: string; at: number }>>();
+
+  /**
+   * True when this exact long text already arrived twice from this number in
+   * the last 30 minutes. A person rarely sends the same 20+ character message
+   * three times; an auto-responder answering our bot does, and each copy would
+   * otherwise cost a full AI reply (and feed a bot-to-bot loop).
+   */
+  private isRepeatedAutoText(phone: string, text: string): boolean {
+    const t = String(text || "").replace(/\s+/g, " ").trim().toLowerCase();
+    if (t.length < 20) return false;
+    const now = Date.now();
+    const list = (this.recentInboundTexts.get(phone) ?? []).filter((e) => now - e.at < 30 * 60_000);
+    const repeats = list.filter((e) => e.text === t).length;
+    list.push({ text: t, at: now });
+    this.recentInboundTexts.set(phone, list.slice(-10));
+    if (this.recentInboundTexts.size > 2000) {
+      for (const [k, v] of this.recentInboundTexts) if (!v.some((e) => now - e.at < 30 * 60_000)) this.recentInboundTexts.delete(k);
+    }
+    return repeats >= 2;
   }
 
   // ── Media-burst coalesce ────────────────────────────────────────────────
@@ -1359,15 +1386,41 @@ export class Session {
 
   /** Queue a bot turn for this customer. Same signature/behavior as before for
    *  callers; the turn just runs in order and within the concurrency cap. */
+  // Newest bot trigger per chat. A text turn still waiting in the queue when a
+  // newer message arrives is skipped: the newer turn reads the full chat history
+  // (the skipped text is already saved there) and answers everything at once.
+  // That saves a whole AI call when a customer sends several short messages.
+  private botSeq = new Map<string, number>();
+  private botSeqCounter = 0;
+
   private triggerBot(shopId: string, phone: string, text: string, mediaType: "audio" | "image" | "document" | null, mediaUrl: string | null, messageId: string | null = null): Promise<void> {
     const key = `${shopId}:${phone}`;
+    const seq = ++this.botSeqCounter;
+    this.botSeq.set(key, seq);
+    // Only a turn that is WAITING behind another turn of the same chat may be
+    // skipped. The first message of a burst always runs, so a new customer's
+    // first-contact greeting is never lost.
+    const queuedBehind = this.botChains.has(key);
     const prev = this.botChains.get(key) ?? Promise.resolve();
     const run = prev.then(async () => {
       await this.acquireBotSlot();
       try {
+        // Media turns are never skipped: the image/voice/PDF itself is only
+        // handed to the AI on its own turn.
+        if (queuedBehind && !mediaType && this.botSeq.get(key) !== seq) {
+          console.log(`[bot] skipped a queued turn for ${phone}: a newer message will answer everything`);
+          return;
+        }
+        // Don't pay for an AI reply that the anti-ban guard would refuse to send.
+        const blocked = this.guard.replyBlockedReason(phone);
+        if (blocked) {
+          console.warn(`[bot] no AI call for ${phone}: reply would be blocked (${blocked})`);
+          return;
+        }
         await withTimeout(this.runBotTurn(shopId, phone, text, mediaType, mediaUrl, messageId), BOT_TURN_WATCHDOG_MS, undefined);
       } finally {
         this.releaseBotSlot();
+        if (this.botSeq.get(key) === seq) this.botSeq.delete(key);
       }
     });
     const tail = run.catch(() => {});

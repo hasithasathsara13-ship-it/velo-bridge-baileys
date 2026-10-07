@@ -331,6 +331,23 @@ export class SendGuard {
     if (this.consecutiveFailures >= AB.breakerFailures) this.trip(AB.breakerCooldownMs, msg);
   }
 
+  /**
+   * Why a reply to `phone` would be refused right now (breaker open, or this
+   * recipient is over its cap), or null if it could go out. Read-only — counts
+   * nothing. Used to skip the AI call when the reply could not be sent anyway.
+   */
+  replyBlockedReason(phone: string): string | null {
+    if (!AB.enabled) return null;
+    const now = Date.now();
+    if (now < this.breakerUntil) return "breaker open";
+    const recent = this.perRecipient.get(phone.replace(/\D/g, "")) ?? [];
+    const lastHour = SendGuard.countSince(recent, now - HOUR_MS).count;
+    if (AB.perRecipientPerHour > 0 && lastHour >= AB.perRecipientPerHour) return "recipient hourly cap";
+    const lastMinute = SendGuard.countSince(recent, now - MINUTE_MS).count;
+    if (AB.perRecipientPerMin > 0 && lastMinute >= AB.perRecipientPerMin) return "recipient per-minute cap";
+    return null;
+  }
+
   private checkBreaker(now: number): void {
     if (now < this.breakerUntil) {
       throw new SendBlockedError(

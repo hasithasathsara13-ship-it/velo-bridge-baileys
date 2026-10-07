@@ -1391,7 +1391,12 @@ export class Session {
           body: JSON.stringify(payload),
           signal: AbortSignal.timeout(BOT_FETCH_TIMEOUT_MS),
         });
-        if (res.status < 500 && res.status !== 429) return res;
+        // Retry ONLY when the request was refused before any AI work was done
+        // (rate limit / gateway unavailable). A 500 or a 504 timeout usually means
+        // the model calls already ran and were billed, so replaying the whole turn
+        // would pay for them again (up to 3x) — those are not retried.
+        const retryable = res.status === 429 || res.status === 502 || res.status === 503;
+        if (!retryable) return res;
         console.warn(`[bot] endpoint returned ${res.status} (attempt ${attempt + 1}) for ${payload.phone_number}`);
       } catch (e) {
         const timedOut = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");

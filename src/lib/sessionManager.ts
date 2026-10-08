@@ -1509,77 +1509,111 @@ export class Session {
       // Small random delay before starting to send (simulates bot "thinking")
       await randomDelay(800, 1500);
 
+      // Every piece below goes through sendReplyPiece(): a cap/pacing refusal is
+      // waited out and retried, and a piece that truly cannot be sent is logged
+      // loudly instead of vanishing (the dashboard already shows the reply).
+
       // Greeting / lead text goes out FIRST so captioned product cards follow it.
       if (captionedImages.length > 0) {
         for (const b of (data.bubbles || []).slice(0, MAX_BOT_BUBBLES)) {
           if (!b.trim()) continue;
-          try {
-            await this.sendText(phone, b);
+          if (await this.sendReplyPiece(phone, "greeting text", () => this.sendText(phone, b))) {
             await randomDelay(800, 1500);
-          } catch (e) {
-            console.error(`[bot] greeting text send failed for ${phone}:`, e);
           }
         }
         // Then each product as a single photo+caption message, 1-2s apart.
         for (const card of captionedImages.slice(0, 8)) {
-          try {
-            await this.sendImage(phone, card.url as string, (card.caption || "").trim() || undefined);
+          if (await this.sendReplyPiece(phone, "product card", () => this.sendImage(phone, card.url as string, (card.caption || "").trim() || undefined))) {
             await randomDelay(1200, 2200);
-          } catch (e) {
-            console.error(`[bot] captioned image send failed for ${phone}:`, e);
           }
         }
         // captioned_images owns the whole reply for this turn — skip the plain
         // image/bubble loops below so nothing is sent twice.
         if (data.reviews_link) {
-          try {
-            await randomDelay(800, 1200);
-            await this.sendText(phone, `⭐ More reviews: ${data.reviews_link}`);
-          } catch { /* ignore */ }
+          await randomDelay(800, 1200);
+          await this.sendReplyPiece(phone, "reviews link", () => this.sendText(phone, `⭐ More reviews: ${data.reviews_link}`));
         }
         return;
       }
 
       // Send images with random delays (typing indicator shown automatically)
       for (const url of (data.images || []).slice(0, 6)) {
-        try {
-          await this.sendImage(phone, url); // Typing indicator built-in
+        if (await this.sendReplyPiece(phone, "image", () => this.sendImage(phone, url))) { // Typing indicator built-in
           await randomDelay(1000, 2000); // Random 1-2 seconds between images
-        } catch (e) {
-          console.error(`[bot] image send failed for ${phone}:`, e);
         }
       }
 
       // Send audio with random delays (typing indicator shown automatically)
       for (const url of (data.audios || []).slice(0, 2)) {
-        try {
-          await this.sendAudio(phone, { url }); // Typing indicator built-in
+        if (await this.sendReplyPiece(phone, "audio", () => this.sendAudio(phone, { url }))) { // Typing indicator built-in
           await randomDelay(1000, 2000); // Random 1-2 seconds between audio
-        } catch (e) {
-          console.error(`[bot] audio send failed for ${phone}:`, e);
         }
       }
 
       // Send text bubbles with typing indicators and random delays
       for (const b of (data.bubbles || []).slice(0, MAX_BOT_BUBBLES)) {
         if (!b.trim()) continue;
-        try {
-          await this.sendText(phone, b); // Typing indicator built-in (based on message length)
+        if (await this.sendReplyPiece(phone, "text", () => this.sendText(phone, b))) { // Typing indicator built-in (based on message length)
           await randomDelay(800, 1500); // Random pause between messages
-        } catch (e) {
-          console.error(`[bot] text send failed for ${phone}:`, e);
         }
       }
 
       if (data.reviews_link) {
-        try { 
-          await randomDelay(800, 1200); // Small pause before review link
-          await this.sendText(phone, `⭐ More reviews: ${data.reviews_link}`); 
-        } catch { /* ignore */ }
+        await randomDelay(800, 1200); // Small pause before review link
+        await this.sendReplyPiece(phone, "reviews link", () => this.sendText(phone, `⭐ More reviews: ${data.reviews_link}`));
       }
     } catch (e) {
       console.error("[triggerBot]", e);
     }
+  }
+
+  /**
+   * Send ONE piece of a bot reply without silently losing it. Returns true if it
+   * went out.
+   *
+   *  - A cap/pacing refusal (SendBlockedError rate_limit / recipient_limit /
+   *    busy) means "not right now": wait the suggested time (only if it is short)
+   *    and try again, up to 4 attempts.
+   *  - "Connection closed / not connected" means nothing was sent, so one retry
+   *    after a short wait is safe. Any other error is NOT retried: a timeout can
+   *    happen after WhatsApp already accepted the message, and a retry would send
+   *    the customer a duplicate.
+   *  - Breaker-open, opt-out and the rest are real stops: logged, not retried.
+   *
+   * A piece that is finally dropped is logged with the word DROPPED so it is easy
+   * to find in `pm2 logs` (the dashboard has already shown the reply by then).
+   */
+  private async sendReplyPiece(phone: string, label: string, send: () => Promise<unknown>): Promise<boolean> {
+    const MAX_TRIES = 4;
+    const MAX_WAIT_MS = 70_000;
+    for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+      try {
+        await send();
+        if (attempt > 1) console.log(`[bot] ${label} for ${phone} sent on attempt ${attempt}`);
+        return true;
+      } catch (e) {
+        if (e instanceof SendBlockedError) {
+          const retryable = !e.permanent && (e.code === "rate_limit" || e.code === "recipient_limit" || e.code === "busy");
+          const waitMs = Math.max(e.retryAfterMs ?? 3000, 1000) + 500;
+          if (!retryable || attempt === MAX_TRIES || waitMs > MAX_WAIT_MS) {
+            console.error(`[bot] ${label} DROPPED for ${phone}: ${e.code} — ${e.message}${waitMs > MAX_WAIT_MS ? ` (would need ${Math.round(waitMs / 1000)}s)` : ""}`);
+            return false;
+          }
+          console.warn(`[bot] ${label} held for ${phone}: ${e.code}; retrying in ${Math.round(waitMs / 1000)}s (attempt ${attempt}/${MAX_TRIES})`);
+          await sleep(waitMs);
+          continue;
+        }
+        const msg = e instanceof Error ? e.message : String(e);
+        if (attempt === 1 && /connection (closed|lost|terminated)|not connected|session not connected/i.test(msg)) {
+          console.warn(`[bot] ${label} for ${phone} hit "${msg}" — nothing was sent, retrying once in 3s`);
+          await sleep(3000);
+          continue;
+        }
+        console.error(`[bot] ${label} FAILED for ${phone} (not retried to avoid a duplicate):`, e);
+        return false;
+      }
+    }
+    return false;
   }
 
   // ─── Send Methods ────────────────────────────────────────────────────────

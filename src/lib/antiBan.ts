@@ -50,13 +50,21 @@ export const AB = {
   markRead: envBool("AB_MARK_READ", true),
 
   // Any outbound message (replies, dashboard sends, proactive): pacing + caps.
-  minGapMs: envNum("AB_MIN_GAP_MS", 1200),
-  gapJitterMs: envNum("AB_GAP_JITTER_MS", 1800),
-  perMinute: envNum("AB_SEND_PER_MIN", 25),
-  perHour: envNum("AB_SEND_PER_HOUR", 300),
-  perDay: envNum("AB_SEND_PER_DAY", 1500),
-  perRecipientPerMin: envNum("AB_RECIPIENT_PER_MIN", 10),
-  perRecipientPerHour: envNum("AB_RECIPIENT_PER_HOUR", 40),
+  //
+  // These are RUNAWAY-LOOP breakers, not a throttle on normal selling. They were
+  // first set too low (25/min, 300/hour, 1500/day; 10/min and 40/hour per
+  // customer): a busy shop sends ~2,700 messages a day (a product reply is 1-3
+  // photos plus 1-3 texts), so everything past the cap was refused and silently
+  // dropped while the dashboard still showed it as sent. The limits below sit
+  // comfortably above real busy-shop traffic yet far below what a bot <->
+  // auto-responder loop produces, and every one can still be overridden by env.
+  minGapMs: envNum("AB_MIN_GAP_MS", 800),
+  gapJitterMs: envNum("AB_GAP_JITTER_MS", 1400),
+  perMinute: envNum("AB_SEND_PER_MIN", 60),
+  perHour: envNum("AB_SEND_PER_HOUR", 1000),
+  perDay: envNum("AB_SEND_PER_DAY", 6000),
+  perRecipientPerMin: envNum("AB_RECIPIENT_PER_MIN", 24),
+  perRecipientPerHour: envNum("AB_RECIPIENT_PER_HOUR", 120),
 
   // Circuit breaker.
   breakerFailures: envNum("AB_BREAKER_FAILURES", 6),

@@ -1487,16 +1487,58 @@ export class Session {
         images?: string[];
         audios?: string[];
         reviews_link?: string;
+        // Ordered product cards: each is ONE WhatsApp message = photo + its own
+        // caption (name, description, price). Sent one at a time, text FIRST, so
+        // the greeting leads and each product arrives as a tidy single bubble
+        // instead of a photo album followed by a wall of captions.
+        captioned_images?: Array<{ url?: string; caption?: string }>;
       };
 
       if (!res.ok || !data?.ok) return;
 
+      const captionedImages = (data.captioned_images || []).filter((c) => c && typeof c.url === "string" && c.url.trim());
+
       // Nothing to send (paused bot, duplicate, quota…) — don't mark as read.
-      const hasOutput = (data.bubbles || []).some((b) => b.trim()) || (data.images || []).length > 0 || (data.audios || []).length > 0;
+      const hasOutput =
+        (data.bubbles || []).some((b) => b.trim()) ||
+        (data.images || []).length > 0 ||
+        captionedImages.length > 0 ||
+        (data.audios || []).length > 0;
       if (hasOutput) await this.markReadBeforeReply(phone);
 
       // Small random delay before starting to send (simulates bot "thinking")
       await randomDelay(800, 1500);
+
+      // Greeting / lead text goes out FIRST so captioned product cards follow it.
+      if (captionedImages.length > 0) {
+        for (const b of (data.bubbles || []).slice(0, MAX_BOT_BUBBLES)) {
+          if (!b.trim()) continue;
+          try {
+            await this.sendText(phone, b);
+            await randomDelay(800, 1500);
+          } catch (e) {
+            console.error(`[bot] greeting text send failed for ${phone}:`, e);
+          }
+        }
+        // Then each product as a single photo+caption message, 1-2s apart.
+        for (const card of captionedImages.slice(0, 8)) {
+          try {
+            await this.sendImage(phone, card.url as string, (card.caption || "").trim() || undefined);
+            await randomDelay(1200, 2200);
+          } catch (e) {
+            console.error(`[bot] captioned image send failed for ${phone}:`, e);
+          }
+        }
+        // captioned_images owns the whole reply for this turn — skip the plain
+        // image/bubble loops below so nothing is sent twice.
+        if (data.reviews_link) {
+          try {
+            await randomDelay(800, 1200);
+            await this.sendText(phone, `⭐ More reviews: ${data.reviews_link}`);
+          } catch { /* ignore */ }
+        }
+        return;
+      }
 
       // Send images with random delays (typing indicator shown automatically)
       for (const url of (data.images || []).slice(0, 6)) {

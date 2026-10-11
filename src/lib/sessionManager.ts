@@ -1529,6 +1529,14 @@ export class Session {
         }
         // captioned_images owns the whole reply for this turn — skip the plain
         // image/bubble loops below so nothing is sent twice.
+        
+        // Send audio voices for showcase products
+        for (const url of (data.audios || []).slice(0, 5)) {
+          if (await this.sendReplyPiece(phone, "audio", () => this.sendAudio(phone, { url }))) {
+            await randomDelay(1000, 2000);
+          }
+        }
+        
         if (data.reviews_link) {
           await randomDelay(800, 1200);
           await this.sendReplyPiece(phone, "reviews link", () => this.sendText(phone, `⭐ More reviews: ${data.reviews_link}`));
@@ -1544,7 +1552,7 @@ export class Session {
       }
 
       // Send audio with random delays (typing indicator shown automatically)
-      for (const url of (data.audios || []).slice(0, 2)) {
+      for (const url of (data.audios || []).slice(0, 5)) {
         if (await this.sendReplyPiece(phone, "audio", () => this.sendAudio(phone, { url }))) { // Typing indicator built-in
           await randomDelay(1000, 2000); // Random 1-2 seconds between audio
         }

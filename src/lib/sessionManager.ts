@@ -1544,6 +1544,14 @@ export class Session {
         return;
       }
 
+      // Send text bubbles with typing indicators and random delays (greeting + answers lead before photos)
+      for (const b of (data.bubbles || []).slice(0, MAX_BOT_BUBBLES)) {
+        if (!b.trim()) continue;
+        if (await this.sendReplyPiece(phone, "text", () => this.sendText(phone, b))) { // Typing indicator built-in (based on message length)
+          await randomDelay(800, 1500); // Random pause between messages
+        }
+      }
+
       // Send images with random delays (typing indicator shown automatically)
       for (const url of (data.images || []).slice(0, 6)) {
         if (await this.sendReplyPiece(phone, "image", () => this.sendImage(phone, url))) { // Typing indicator built-in
@@ -1555,14 +1563,6 @@ export class Session {
       for (const url of (data.audios || []).slice(0, 5)) {
         if (await this.sendReplyPiece(phone, "audio", () => this.sendAudio(phone, { url }))) { // Typing indicator built-in
           await randomDelay(1000, 2000); // Random 1-2 seconds between audio
-        }
-      }
-
-      // Send text bubbles with typing indicators and random delays
-      for (const b of (data.bubbles || []).slice(0, MAX_BOT_BUBBLES)) {
-        if (!b.trim()) continue;
-        if (await this.sendReplyPiece(phone, "text", () => this.sendText(phone, b))) { // Typing indicator built-in (based on message length)
-          await randomDelay(800, 1500); // Random pause between messages
         }
       }
 

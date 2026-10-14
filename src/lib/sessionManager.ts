@@ -1492,6 +1492,7 @@ export class Session {
         // the greeting leads and each product arrives as a tidy single bubble
         // instead of a photo album followed by a wall of captions.
         captioned_images?: Array<{ url?: string; caption?: string }>;
+        greeting_bubbles?: string[];
       };
 
       if (!res.ok || !data?.ok) return;
@@ -1501,6 +1502,7 @@ export class Session {
       // Nothing to send (paused bot, duplicate, quota…) — don't mark as read.
       const hasOutput =
         (data.bubbles || []).some((b) => b.trim()) ||
+        (data.greeting_bubbles || []).some((b) => b.trim()) ||
         (data.images || []).length > 0 ||
         captionedImages.length > 0 ||
         (data.audios || []).length > 0;
@@ -1544,18 +1546,33 @@ export class Session {
         return;
       }
 
-      // Send text bubbles with typing indicators and random delays (greeting + answers lead before photos)
-      for (const b of (data.bubbles || []).slice(0, MAX_BOT_BUBBLES)) {
-        if (!b.trim()) continue;
-        if (await this.sendReplyPiece(phone, "text", () => this.sendText(phone, b))) { // Typing indicator built-in (based on message length)
-          await randomDelay(800, 1500); // Random pause between messages
+      // Extract greeting bubbles, images, and reply bubbles.
+      // Order required on first contact: 1. Greeting -> 2. Product photos -> 3. Product description / answer
+      const greetingBubbles = (data.greeting_bubbles || []).filter((b) => b && typeof b === "string" && b.trim());
+      const greetingSet = new Set(greetingBubbles);
+      const replyBubbles = (data.bubbles || []).filter((b) => b && typeof b === "string" && b.trim() && !greetingSet.has(b.trim()));
+      const images = (data.images || []).filter((url) => url && typeof url === "string" && url.trim());
+
+      // 1. Send greeting bubbles first
+      if (greetingBubbles.length > 0) {
+        for (const b of greetingBubbles.slice(0, MAX_BOT_BUBBLES)) {
+          if (await this.sendReplyPiece(phone, "greeting text", () => this.sendText(phone, b))) {
+            await randomDelay(800, 1500);
+          }
         }
       }
 
-      // Send images with random delays (typing indicator shown automatically)
-      for (const url of (data.images || []).slice(0, 6)) {
-        if (await this.sendReplyPiece(phone, "image", () => this.sendImage(phone, url))) { // Typing indicator built-in
-          await randomDelay(1000, 2000); // Random 1-2 seconds between images
+      // 2. Send images (product photos) second
+      for (const url of images.slice(0, 6)) {
+        if (await this.sendReplyPiece(phone, "image", () => this.sendImage(phone, url))) {
+          await randomDelay(1000, 2000);
+        }
+      }
+
+      // 3. Send answer / product description bubbles third
+      for (const b of replyBubbles.slice(0, MAX_BOT_BUBBLES)) {
+        if (await this.sendReplyPiece(phone, "reply text", () => this.sendText(phone, b))) {
+          await randomDelay(800, 1500);
         }
       }
 

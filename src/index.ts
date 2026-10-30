@@ -32,9 +32,38 @@ app.use(authMiddleware);
 app.use("/session", sessionRouter);
 app.use("/message", messageRouter);
 
+// 24/7 Follow-Up Cron Trigger: ping Vercel checkout-reminder endpoint every hour
+function startFollowUpScheduler() {
+  const frontendUrl = (process.env.FRONTEND_URL || "https://veloai.pro").replace(/\/+$/, "");
+  const cronSecret = process.env.CRON_SECRET || "123";
+  const intervalMs = Number(process.env.FOLLOWUP_CRON_INTERVAL_MS) || 60 * 60 * 1000; // 1 hour
+
+  const triggerCron = async () => {
+    try {
+      console.log(`[bridge-baileys] ⏰ Triggering follow-up reminder cron at ${frontendUrl}...`);
+      const res = await fetch(`${frontendUrl}/api/cron/checkout-reminder?key=${cronSecret}`, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${cronSecret}` },
+        signal: AbortSignal.timeout(60_000),
+      });
+      console.log(`[bridge-baileys] ⏰ Follow-up cron response: ${res.status} ${res.statusText}`);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn(`[bridge-baileys] ⏰ Follow-up cron trigger failed:`, msg);
+    }
+  };
+
+  // Initial trigger after 2 minutes (so bridge sessions have time to connect first)
+  setTimeout(() => {
+    void triggerCron();
+    setInterval(triggerCron, intervalMs);
+  }, 120_000);
+}
+
 app.listen(PORT, () => {
   console.log(`[bridge-baileys] Running on port ${PORT} (baileys-v7-phone-resend)`);
   restoreSessions().catch((err) => console.error("[bridge-baileys] restoreSessions failed:", err));
+  startFollowUpScheduler();
 });
 
 // Graceful shutdown — destroy all WhatsApp sessions before exit

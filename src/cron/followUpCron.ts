@@ -5,9 +5,10 @@
  * - Runs ONLY during daytime business hours (9:00 AM - 8:00 PM Sri Lanka time).
  * - Only sends to customers who messaged within the last 72h (WhatsApp-safe window).
  * - Never messages customers who already ordered or received a reminder in the last 3 days.
+ * - Prioritizes the best 30 highest-intent leads per day per business.
+ * - Follow-up wait timing selectable: 4 hours, 6 hours, or 12 hours.
  * - Uses session.queueProactive() which spaces messages with 20s-60s randomized jitter,
  *   simulates human typing presence, and limits to max 15 messages/hour per number.
- * - Caps each business to its configured daily quota (default 25/day).
  */
 
 import { getSupabase } from "../lib/supabase.js";
@@ -42,9 +43,9 @@ const TOPIC_PATTERNS: Array<[Topic, RegExp]> = [
 ];
 
 const NAME_STOP = new Set(["the", "and", "for", "with", "new", "powder", "bags", "bag", "instant", "natural", "products", "item", "pack"]);
-const ACTIVE_WINDOW_MS = 3 * 3_600_000; // customer messaged in last 3h -> still chatting
 const STALE_WINDOW_MS = 72 * 3_600_000; // > 72h -> WhatsApp spam risk
 const FOLLOWUP_COOLDOWN_MS = 3 * 24 * 3_600_000; // 3 days
+const BUYING_TOPICS = new Set<Topic>(["price", "size", "colour", "delivery", "availability"]);
 
 export function extractProductAliases(p: FollowUpProduct): string[] {
   const aliases: string[] = [p.name.trim().toLowerCase()];
@@ -184,13 +185,53 @@ function isWithinActiveHours(): boolean {
     return hour >= 9 && hour < 20;
   } catch {
     const utcHour = new Date().getUTCHours();
-    // UTC+5:30 -> 9 AM Colombo is ~3:30 UTC, 8 PM Colombo is ~14:30 UTC
     return utcHour >= 4 && utcHour < 15;
   }
 }
 
+/** Calculate lead quality score to prioritize the best leads */
+export function calculateLeadScore(
+  topics: Topic[],
+  matchedProduct: FollowUpProduct | null,
+  customerTexts: string[],
+  lastCustomerAt: number | null,
+  now: number,
+): number {
+  let score = 0;
+  if (topics.some((t) => BUYING_TOPICS.has(t))) score += 4;
+  else if (topics.length > 0) score += 2;
+
+  if (matchedProduct) score += 3;
+
+  const realCustMsgs = customerTexts.filter((t) => {
+    const s = t.trim();
+    return s && !GREETING_ONLY.test(s) && s !== "[sent an attachment]";
+  }).length;
+
+  if (realCustMsgs >= 4) score += 3;
+  else if (realCustMsgs >= 2) score += 2;
+  else score += 1;
+
+  const hoursSinceCustomer = (now - (lastCustomerAt ?? 0)) / 3_600_000;
+  if (hoursSinceCustomer <= 24) score += 2;
+  else if (hoursSinceCustomer <= 48) score += 1;
+
+  return score;
+}
+
+interface QualifiedCandidate {
+  candidateId: string;
+  phone: string;
+  score: number;
+  lastCustomerAt: number;
+  messageText: string;
+  prefix: string;
+}
+
 /**
  * Main cron function executed 24/7 on Zeabur/VPS.
+ * Strictly limits to max 30 follow-up messages per day per business,
+ * sending to the best-scoring leads first.
  */
 export async function runFollowUpJob(): Promise<{ examined: number; queued: number; skipped: number }> {
   const sb = getSupabase();
@@ -230,7 +271,8 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
       continue;
     }
 
-    // 3. Daily Proactive Cap per Shop
+    // 3. Daily Cap: strictly at most 30 messages per day per shop
+    const MAX_DAILY_FOLLOWUPS = 30;
     const dayAgo = new Date(now - 24 * 3_600_000).toISOString();
     const { data: recentSent } = await sb
       .from("messages")
@@ -242,13 +284,16 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
       .limit(35);
 
     const sentToday = recentSent?.length ?? 0;
-    const maxPerDay = Math.min(30, Number(biz.followup_max_per_day) || 25);
-    const room = Math.max(0, maxPerDay - sentToday);
+    const room = Math.max(0, MAX_DAILY_FOLLOWUPS - sentToday);
 
     if (room <= 0) {
-      console.log(`[followup-cron] Shop "${biz.business_name}" reached daily follow-up limit (${sentToday}/${maxPerDay}).`);
+      console.log(`[followup-cron] Shop "${biz.business_name}" reached daily follow-up limit (${sentToday}/${MAX_DAILY_FOLLOWUPS}).`);
       continue;
     }
+
+    // Wait hours chosen by business: 4, 6, or 12 hours (defaults to 4)
+    const waitHours = [4, 6, 12].includes(Number(biz.followup_wait_hours)) ? Number(biz.followup_wait_hours) : 4;
+    const quietWindowMs = waitHours * 3_600_000;
 
     // 4. Fetch Products for catalog matching
     const { data: productsRaw } = await sb
@@ -258,8 +303,7 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
       .eq("is_active", true);
     const products: FollowUpProduct[] = (productsRaw ?? []).filter((p) => p.name);
 
-    // 5. Fetch Candidates Due for this shop (capped to small batch to avoid queue flood)
-    const batchLimit = Math.min(room, 10);
+    // 5. Fetch Candidates Due for this shop (fetch up to 60 to evaluate and pick the best)
     const { data: candidates, error: cErr } = await sb
       .from("customers")
       .select("id, phone_number, checkout_reminder_at, reminder_kind")
@@ -269,13 +313,14 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
       .not("checkout_reminder_at", "is", null)
       .lte("checkout_reminder_at", nowIso)
       .order("checkout_reminder_at", { ascending: false })
-      .limit(batchLimit);
+      .limit(60);
 
     if (cErr || !candidates?.length) {
       continue;
     }
 
     totalExamined += candidates.length;
+    const qualified: QualifiedCandidate[] = [];
 
     for (const c of candidates) {
       try {
@@ -326,9 +371,9 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
           continue;
         }
 
-        // Check Active (<3h): wait for chat to calm down
-        if (lastCustomerAt && now - lastCustomerAt < ACTIVE_WINDOW_MS) {
-          totalSkipped++;
+        // Check Quiet Window (< waitHours e.g. 4h, 6h, 12h): customer still in silence window
+        if (lastCustomerAt && now - lastCustomerAt < quietWindowMs) {
+          // Leave eligible for subsequent run
           continue;
         }
 
@@ -376,6 +421,9 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
         const topics = TOPIC_PATTERNS.filter(([, re]) => re.test(combinedTexts)).map(([t]) => t);
         const language = detectLanguage(customerTexts);
 
+        // Calculate lead quality score
+        const score = calculateLeadScore(topics, matchedProduct, customerTexts, lastCustomerAt, now);
+
         // Formulate follow-up message text
         let messageText = "";
         let prefix = "[interest reminder]";
@@ -391,25 +439,47 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
           continue;
         }
 
-        // Queue directly into Baileys session's anti-ban proactive queue!
-        // This automatically paces the message with 20s-60s jitter and simulates human typing.
-        await session.queueProactive(phone, messageText);
+        qualified.push({
+          candidateId: c.id,
+          phone,
+          score,
+          lastCustomerAt: lastCustomerAt ?? 0,
+          messageText,
+          prefix,
+        });
+      } catch (err: unknown) {
+        console.warn(`[followup-cron] Failed to evaluate customer ${c.id}:`, (err as Error)?.message || err);
+      }
+    }
+
+    // Sort qualified leads: highest intent score first, then most recent interaction
+    qualified.sort((a, b) => b.score - a.score || b.lastCustomerAt - a.lastCustomerAt);
+
+    // Pick the best leads up to room and single-run batch limit (max 10 per run to pace safely)
+    const batchLimit = Math.min(room, 10);
+    const toSend = qualified.slice(0, batchLimit);
+
+    for (const lead of toSend) {
+      try {
+        // Queue directly into Baileys session's anti-ban proactive queue
+        // (automatically paces with 20s-60s jitter and simulates human typing)
+        await session.queueProactive(lead.phone, lead.messageText);
 
         // Record in messages table
         await sb.from("messages").insert({
           shop_id: shopId,
-          phone_number: phone,
+          phone_number: lead.phone,
           role: "model",
-          content: `${prefix} ${messageText}`,
+          content: `${lead.prefix} ${lead.messageText}`,
         });
 
         // Mark sent
-        await sb.from("customers").update({ checkout_reminder_sent: true }).eq("id", c.id);
+        await sb.from("customers").update({ checkout_reminder_sent: true }).eq("id", lead.candidateId);
 
         totalQueued++;
-        console.log(`[followup-cron] ✅ Queued follow-up for ${biz.business_name} -> ${phone}`);
+        console.log(`[followup-cron] ✅ Queued best lead (score ${lead.score}) for ${biz.business_name} -> ${lead.phone}`);
       } catch (err: unknown) {
-        console.warn(`[followup-cron] Failed to queue for customer ${c.id}:`, (err as Error)?.message || err);
+        console.warn(`[followup-cron] Failed to queue lead ${lead.candidateId}:`, (err as Error)?.message || err);
       }
     }
   }

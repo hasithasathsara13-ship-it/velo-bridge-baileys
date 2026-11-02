@@ -6,6 +6,7 @@ import { sessionRouter } from "./routes/session.js";
 import { messageRouter } from "./routes/messages.js";
 import { authMiddleware } from "./middleware/auth.js";
 import { restoreSessions, getAllSessions } from "./lib/sessionManager.js";
+import { runFollowUpJob } from "./cron/followUpCron.js";
 
 process.on("uncaughtException", (err) => console.error("[bridge] Uncaught:", err.message));
 process.on("unhandledRejection", (err) => console.error("[bridge] Unhandled:", err));
@@ -32,24 +33,18 @@ app.use(authMiddleware);
 app.use("/session", sessionRouter);
 app.use("/message", messageRouter);
 
-// 24/7 Follow-Up Cron Trigger: ping Vercel checkout-reminder endpoint every hour
+// 24/7 Follow-Up Cron Trigger: runs native safe follow-up engine directly on VPS/Zeabur
 function startFollowUpScheduler() {
-  const frontendUrl = (process.env.FRONTEND_URL || "https://veloai.pro").replace(/\/+$/, "");
-  const cronSecret = process.env.CRON_SECRET || "123";
-  const intervalMs = Number(process.env.FOLLOWUP_CRON_INTERVAL_MS) || 60 * 60 * 1000; // 1 hour
+  const intervalMs = Number(process.env.FOLLOWUP_CRON_INTERVAL_MS) || 30 * 60 * 1000; // default 30 mins
 
   const triggerCron = async () => {
     try {
-      console.log(`[bridge-baileys] ⏰ Triggering follow-up reminder cron at ${frontendUrl}...`);
-      const res = await fetch(`${frontendUrl}/api/cron/checkout-reminder?key=${cronSecret}`, {
-        method: "GET",
-        headers: { Authorization: `Bearer ${cronSecret}` },
-        signal: AbortSignal.timeout(60_000),
-      });
-      console.log(`[bridge-baileys] ⏰ Follow-up cron response: ${res.status} ${res.statusText}`);
+      console.log(`[bridge-baileys] ⏰ Starting native 24/7 follow-up reminder job...`);
+      const res = await runFollowUpJob();
+      console.log(`[bridge-baileys] ⏰ Follow-up job finished: ${res.queued} queued, ${res.skipped} skipped, ${res.examined} examined.`);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      console.warn(`[bridge-baileys] ⏰ Follow-up cron trigger failed:`, msg);
+      console.warn(`[bridge-baileys] ⏰ Follow-up cron failed:`, msg);
     }
   };
 

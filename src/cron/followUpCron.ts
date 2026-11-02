@@ -189,6 +189,16 @@ function isWithinActiveHours(): boolean {
   }
 }
 
+/** Calculate the start of today's 9:00 AM window in Asia/Colombo */
+function getTodayWindowStart(): string {
+  try {
+    const colomboDate = new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Colombo" });
+    return new Date(`${colomboDate}T09:00:00+05:30`).toISOString();
+  } catch {
+    return new Date(Date.now() - 24 * 3_600_000).toISOString();
+  }
+}
+
 /** Calculate lead quality score to prioritize the best leads */
 export function calculateLeadScore(
   topics: Topic[],
@@ -271,16 +281,16 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
       continue;
     }
 
-    // 3. Daily Cap: strictly at most 30 messages per day per shop
+    // 3. Daily Cap: strictly at most 30 messages per day per shop (resets at 9:00 AM today)
     const MAX_DAILY_FOLLOWUPS = 30;
-    const dayAgo = new Date(now - 24 * 3_600_000).toISOString();
+    const windowStart = getTodayWindowStart();
     const { data: recentSent } = await sb
       .from("messages")
       .select("id")
       .eq("shop_id", shopId)
       .eq("role", "model")
       .like("content", "[% reminder]%")
-      .gte("created_at", dayAgo)
+      .gte("created_at", windowStart)
       .limit(35);
 
     const sentToday = recentSent?.length ?? 0;

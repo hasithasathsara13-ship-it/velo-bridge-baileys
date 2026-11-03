@@ -899,8 +899,8 @@ export class Session {
       const isSinhala = /[\u0D80-\u0DFF]/.test(recentText);
 
       const replyText = isSinhala
-        ? "සමාවෙන්න, මේ මොහොතේ අප කාර්යබහුල බැවින් ඔබගේ ඇමතුමට සම්බන්ධ වීමට නොහැකි විය. අප ඉක්මනින්ම ඔබව සම්බන්ධ කරගන්නෙමු. කරුණාකර ඔබට අවශ්‍ය විස්තර මෙහි සටහන් කරන්න. ස්තූතියි!"
-        : "Sorry, we missed your call as we are busy at the moment. We will get back to you shortly. Please leave your message or inquiry here. Thank you!";
+        ? "Sorry, මේ මොහොතේ අප කාර්යබහුල බැවින් ඔබගේ ඇමතුමට සම්බන්ධ වීමට නොහැකි. අප ඉක්මනින්ම ඔබව සම්බන්ධ කරගන්නෙමු. Thanks!"
+        : "Sorry, we missed your call as we are busy at the moment. We will get back to you shortly. Thanks!";
 
       console.log(`[call] Missed call from ${phone} -> sending ${isSinhala ? "Sinhala" : "English"} auto-reply`);
 
@@ -1191,8 +1191,8 @@ export class Session {
       const isSinhala = /[\u0D80-\u0DFF]/.test(recentText);
 
       const tooLargeReply = isSinhala
-        ? "ඔබ එවා ඇති ගොනුව විශාල වැඩියි (10MB ට වඩා වැඩියි). කරුණාකර 10MB ට අඩු ගොනුවක් හෝ ඡායාරූපයක් එවන්න."
-        : "The file you sent is too large to process (exceeds 10MB limit). Please send a file or photo smaller than 10MB.";
+        ? "File size එක විශාල වැඩියි (10MB ට වඩා වැඩියි). කරුණාකර 10MB ට අඩු ගොනුවක් හෝ ඡායාරූපයක් එවන්න"
+        : "The file size is too large (over 10MB). Please send a file or photo smaller than 10MB.";
 
       await this.sendReplyPiece(phone, "file size limit notice", () => this.sendText(phone, tooLargeReply));
       await sb.from("messages").insert([

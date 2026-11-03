@@ -10,6 +10,7 @@ import makeWASocket, {
   type WAMessageKey,
   type ConnectionState,
   type Contact,
+  type WACallEvent,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import { pino } from "pino";
@@ -688,6 +689,11 @@ export class Session {
       }
     });
 
+    // Handle incoming calls (missed calls / rejected without answering)
+    sock.ev.on("call", (calls: WACallEvent[]) => {
+      this.onCallUpdate(calls).catch((err) => console.error(`[session ${this.info.shopId}] call error:`, err));
+    });
+
     // Phone pairing: request the code once creds are not yet registered.
     if (this.pairingPhone && !sock.authState.creds.registered && !this.pairingRequested) {
       this.pairingRequested = true;
@@ -822,6 +828,96 @@ export class Session {
    *  Resets once the socket shows a QR or opens. If connect() itself throws
    *  (e.g. a disk error) no 'close' event will ever arrive, so retry here
    *  instead of leaving the session stuck on "connecting" forever. */
+  /** Track incoming calls to detect if answered or missed. */
+  private callStates = new Map<string, { answered: boolean; handled: boolean; callerPn?: string; timestamp: number }>();
+  /** Cooldown: max 1 missed-call auto-reply per customer phone every 10 minutes. */
+  private lastMissedCallReplyAt = new Map<string, number>();
+
+  private async onCallUpdate(calls: WACallEvent[]): Promise<void> {
+    for (const call of calls || []) {
+      const callId = call?.id;
+      if (!callId) continue;
+      let state = this.callStates.get(callId);
+      if (!state) {
+        state = { answered: false, handled: false, callerPn: call.callerPn, timestamp: Date.now() };
+        this.callStates.set(callId, state);
+      }
+      if (call.callerPn && !state.callerPn) {
+        state.callerPn = call.callerPn;
+      }
+
+      // If the call was answered by the owner on their phone, never send the missed-call message!
+      if (call.status === "accept") {
+        state.answered = true;
+        continue;
+      }
+
+      // Missed call: ended automatically without answering (timeout) or declined/ended by owner (reject)
+      const isMissed = call.status === "timeout" || call.status === "reject";
+      if (isMissed && !state.answered && !state.handled) {
+        state.handled = true;
+        if (call.isGroup) continue;
+
+        const fromJid = call.from || call.chatId || "";
+        const phone = this.phoneFromPn(call.callerPn) || jidUserDigits(fromJid);
+        if (!phone || phone.length < 8) continue;
+
+        const now = Date.now();
+        const lastReply = this.lastMissedCallReplyAt.get(phone) || 0;
+        if (now - lastReply < 10 * 60 * 1000) continue; // 10-minute cooldown
+        this.lastMissedCallReplyAt.set(phone, now);
+
+        if (this.callStates.size > 500) {
+          const oldest = this.callStates.keys().next().value;
+          if (oldest !== undefined) this.callStates.delete(oldest);
+        }
+        if (this.lastMissedCallReplyAt.size > 500) {
+          const oldest = this.lastMissedCallReplyAt.keys().next().value;
+          if (oldest !== undefined) this.lastMissedCallReplyAt.delete(oldest);
+        }
+
+        void this.handleMissedCallAutoReply(phone);
+      }
+    }
+  }
+
+  private async handleMissedCallAutoReply(phone: string): Promise<void> {
+    try {
+      const sb = getSupabase();
+      const shopId = this.info.shopId;
+
+      // Check language from recent messages with this customer
+      const { data: recentMsgs } = await sb
+        .from("messages")
+        .select("content")
+        .eq("shop_id", shopId)
+        .eq("phone_number", phone)
+        .order("created_at", { ascending: false })
+        .limit(6);
+
+      const recentText = (recentMsgs || []).map((m: any) => m.content || "").join(" ");
+      const isSinhala = /[\u0D80-\u0DFF]/.test(recentText);
+
+      const replyText = isSinhala
+        ? "සමාවෙන්න, මේ මොහොතේ අප කාර්යබහුල බැවින් ඔබගේ ඇමතුමට සම්බන්ධ වීමට නොහැකි විය. අප ඉක්මනින්ම ඔබව සම්බන්ධ කරගන්නෙමු. කරුණාකර ඔබට අවශ්‍ය විස්තර මෙහි සටහන් කරන්න. ස්තූතියි!"
+        : "Sorry, we missed your call as we are busy at the moment. We will get back to you shortly. Please leave your message or inquiry here. Thank you!";
+
+      console.log(`[call] Missed call from ${phone} -> sending ${isSinhala ? "Sinhala" : "English"} auto-reply`);
+
+      await this.sendReplyPiece(phone, "missed call auto-reply", () => this.sendText(phone, replyText));
+
+      await sb.from("messages").insert({
+        shop_id: shopId,
+        phone_number: phone,
+        role: "model",
+        content: replyText,
+        delivery_status: "sent",
+      });
+    } catch (e: any) {
+      console.error(`[call] Failed to send missed call auto-reply to ${phone}:`, e?.message || e);
+    }
+  }
+
   private scheduleReconnect(baseMs: number): void {
     if (this.reconnecting || this.stopped) return;
     this.reconnecting = true;
@@ -1078,6 +1174,44 @@ export class Session {
     let caption = "";
 
     const isMedia = Boolean(content.imageMessage || content.audioMessage || content.videoMessage || content.documentMessage);
+    const MAX_MEDIA_BYTES = 10 * 1024 * 1024; // 10MB limit
+    const mediaMsg = content.imageMessage || content.audioMessage || content.videoMessage || content.documentMessage;
+    const declaredMediaSize = Number((mediaMsg as any)?.fileLength || 0);
+
+    if (isMedia && declaredMediaSize > MAX_MEDIA_BYTES) {
+      console.warn(`[msg] rejected media from ${phone}: declared size ${(declaredMediaSize / (1024 * 1024)).toFixed(1)}MB exceeds 10MB limit`);
+      const { data: recentMsgs } = await sb
+        .from("messages")
+        .select("content")
+        .eq("shop_id", shopId)
+        .eq("phone_number", phone)
+        .order("created_at", { ascending: false })
+        .limit(5);
+      const recentText = [(mediaMsg as any)?.caption || "", ...(recentMsgs || []).map((m: any) => m.content || "")].join(" ");
+      const isSinhala = /[\u0D80-\u0DFF]/.test(recentText);
+
+      const tooLargeReply = isSinhala
+        ? "ඔබ එවා ඇති ගොනුව විශාල වැඩියි (10MB ට වඩා වැඩියි). කරුණාකර 10MB ට අඩු ගොනුවක් හෝ ඡායාරූපයක් එවන්න."
+        : "The file you sent is too large to process (exceeds 10MB limit). Please send a file or photo smaller than 10MB.";
+
+      await this.sendReplyPiece(phone, "file size limit notice", () => this.sendText(phone, tooLargeReply));
+      await sb.from("messages").insert([
+        {
+          shop_id: shopId,
+          phone_number: phone,
+          role: "user",
+          content: `📎 [File too large to process: ${(declaredMediaSize / (1024 * 1024)).toFixed(1)}MB]`,
+        },
+        {
+          shop_id: shopId,
+          phone_number: phone,
+          role: "model",
+          content: tooLargeReply,
+          delivery_status: "sent",
+        },
+      ]);
+      return;
+    }
 
     // Count this photo/file before download. Album items are handled in
     // parallel; if we only debounce after upload, 10 photos finish seconds

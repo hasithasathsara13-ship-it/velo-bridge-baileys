@@ -1440,7 +1440,7 @@ export class Session {
       try {
         res = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "x-bridge-secret": secret },
+          headers: { "Content-Type": "application/json", "x-bridge-secret": secret, "x-bridge-supports": "showcase" },
           body: JSON.stringify(payload),
           signal: AbortSignal.timeout(BOT_FETCH_TIMEOUT_MS),
         });
@@ -1515,9 +1515,19 @@ export class Session {
       // waited out and retried, and a piece that truly cannot be sent is logged
       // loudly instead of vanishing (the dashboard already shows the reply).
 
-      // Greeting / lead text goes out FIRST so captioned product cards follow it.
+      // Extract greeting bubbles, images, and reply bubbles.
+      // Order required on first contact:
+      // 1. Greeting -> 2. Showcase cards (or product photos) -> 3. AI reply / answer
+      const greetingBubbles = (data.greeting_bubbles || []).filter((b) => b && typeof b === "string" && b.trim());
+      const greetingSet = new Set(greetingBubbles.map((b) => b.trim()));
+      const replyBubbles = (data.bubbles || []).filter((b) => b && typeof b === "string" && b.trim() && !greetingSet.has(b.trim()));
+      const images = (data.images || []).filter((url) => url && typeof url === "string" && url.trim());
+
+      // Greeting / lead text goes out FIRST, then captioned showcase product cards,
+      // and finally any AI reply answering a first-contact question (e.g. courier charge or pack price).
       if (captionedImages.length > 0) {
-        for (const b of (data.bubbles || []).slice(0, MAX_BOT_BUBBLES)) {
+        const leadBubbles = greetingBubbles.length > 0 ? greetingBubbles : replyBubbles;
+        for (const b of leadBubbles.slice(0, MAX_BOT_BUBBLES)) {
           if (!b.trim()) continue;
           if (await this.sendReplyPiece(phone, "greeting text", () => this.sendText(phone, b))) {
             await randomDelay(800, 1500);
@@ -1529,29 +1539,31 @@ export class Session {
             await randomDelay(1200, 2200);
           }
         }
-        // captioned_images owns the whole reply for this turn — skip the plain
-        // image/bubble loops below so nothing is sent twice.
-        
+
         // Send audio voices for showcase products
         for (const url of (data.audios || []).slice(0, 5)) {
           if (await this.sendReplyPiece(phone, "audio", () => this.sendAudio(phone, { url }))) {
             await randomDelay(1000, 2000);
           }
         }
-        
+
+        // If the customer also asked a question on first contact (e.g. courier charge or specific pack price),
+        // send the AI answer bubble(s) AFTER the greeting and showcase products!
+        if (greetingBubbles.length > 0 && replyBubbles.length > 0) {
+          for (const b of replyBubbles.slice(0, MAX_BOT_BUBBLES)) {
+            if (!b.trim()) continue;
+            if (await this.sendReplyPiece(phone, "reply text", () => this.sendText(phone, b))) {
+              await randomDelay(800, 1500);
+            }
+          }
+        }
+
         if (data.reviews_link) {
           await randomDelay(800, 1200);
           await this.sendReplyPiece(phone, "reviews link", () => this.sendText(phone, `⭐ More reviews: ${data.reviews_link}`));
         }
         return;
       }
-
-      // Extract greeting bubbles, images, and reply bubbles.
-      // Order required on first contact: 1. Greeting -> 2. Product photos -> 3. Product description / answer
-      const greetingBubbles = (data.greeting_bubbles || []).filter((b) => b && typeof b === "string" && b.trim());
-      const greetingSet = new Set(greetingBubbles);
-      const replyBubbles = (data.bubbles || []).filter((b) => b && typeof b === "string" && b.trim() && !greetingSet.has(b.trim()));
-      const images = (data.images || []).filter((url) => url && typeof url === "string" && url.trim());
 
       // 1. Send greeting bubbles first
       if (greetingBubbles.length > 0) {

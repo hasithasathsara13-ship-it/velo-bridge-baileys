@@ -611,8 +611,8 @@ export class Session {
     });
     sock.ev.on("messages.update", (updates) => {
       for (const u of updates || []) {
-        if (u?.update?.message && u.key) {
-          this.dispatchWaMessage({ key: u.key, message: u.update.message } as WAMessage);
+        if (u?.update && u.key && (u.update.message || (u.update as any).messageStubType)) {
+          this.dispatchWaMessage({ key: u.key, ...u.update } as WAMessage);
         }
         const waId = u?.key?.id;
         const st = u?.update?.status;
@@ -837,6 +837,10 @@ export class Session {
     for (const call of calls || []) {
       const callId = call?.id;
       if (!callId) continue;
+
+      // Ignore old call events (older than 3 minutes) e.g. during reconnect/history sync
+      if (call.date && Date.now() - call.date.getTime() > 3 * 60 * 1000) continue;
+
       let state = this.callStates.get(callId);
       if (!state) {
         state = { answered: false, handled: false, callerPn: call.callerPn, timestamp: Date.now() };
@@ -847,19 +851,32 @@ export class Session {
       }
 
       // If the call was answered by the owner on their phone, never send the missed-call message!
-      if (call.status === "accept") {
+      if (call.status === "accept" || call.status === "preaccept") {
         state.answered = true;
         continue;
       }
 
-      // Missed call: ended automatically without answering (timeout) or declined/ended by owner (reject)
-      const isMissed = call.status === "timeout" || call.status === "reject";
+      // Missed call: ended automatically without answering (timeout), declined/ended by owner (reject), or terminated without answering
+      const isMissed =
+        call.status === "timeout" ||
+        call.status === "reject" ||
+        (call.status === "terminate" && !state.answered);
+
       if (isMissed && !state.answered && !state.handled) {
         state.handled = true;
         if (call.isGroup) continue;
 
         const fromJid = call.from || call.chatId || "";
-        const phone = this.phoneFromPn(call.callerPn) || jidUserDigits(fromJid);
+        let phone = this.phoneFromPn(call.callerPn) || this.phoneFromPn(fromJid);
+        if (!phone && fromJid.includes("@lid")) {
+          phone = this.lidToPhone.get(jidUserDigits(fromJid)) || "";
+          if (!phone) {
+            phone = await this.resolveLidViaUsync(jidUserDigits(fromJid)).catch(() => "");
+          }
+        }
+        if (!phone) {
+          phone = jidUserDigits(fromJid);
+        }
         if (!phone || phone.length < 8) continue;
 
         const now = Date.now();
@@ -876,6 +893,7 @@ export class Session {
           if (oldest !== undefined) this.lastMissedCallReplyAt.delete(oldest);
         }
 
+        console.log(`[call] Unanswered call detected via call-event (${call.status}) from ${phone}`);
         void this.handleMissedCallAutoReply(phone);
       }
     }
@@ -885,6 +903,12 @@ export class Session {
     try {
       const sb = getSupabase();
       const shopId = this.info.shopId;
+
+      // Ensure customer record exists
+      await sb.from("customers").upsert(
+        { shop_id: shopId, phone_number: phone, bot_active: true },
+        { onConflict: "shop_id,phone_number", ignoreDuplicates: true },
+      );
 
       // Check language from recent messages with this customer
       const { data: recentMsgs } = await sb
@@ -896,7 +920,9 @@ export class Session {
         .limit(6);
 
       const recentText = (recentMsgs || []).map((m: any) => m.content || "").join(" ");
-      const isSinhala = /[\u0D80-\u0DFF]/.test(recentText);
+      const hasSinhala = /[\u0D80-\u0DFF]/.test(recentText);
+      const hasSinglish = /\b(meka|eka|denna|puluwanda|kiyada|thiyenawada|ow|neha|mata|oyata|karanna|enna)\b/i.test(recentText);
+      const isSinhala = hasSinhala || hasSinglish || ((recentMsgs?.length || 0) === 0 && phone.startsWith("94"));
 
       const replyText = isSinhala
         ? "Sorry, මේ මොහොතේ අප කාර්යබහුල බැවින් ඔබගේ ඇමතුමට සම්බන්ධ වීමට නොහැකි. අප ඉක්මනින්ම ඔබව සම්බන්ධ කරගන්නෙමු. Thanks!"
@@ -904,7 +930,12 @@ export class Session {
 
       console.log(`[call] Missed call from ${phone} -> sending ${isSinhala ? "Sinhala" : "English"} auto-reply`);
 
-      await this.sendReplyPiece(phone, "missed call auto-reply", () => this.sendText(phone, replyText));
+      let sentId = "";
+      await this.sendReplyPiece(phone, "missed call auto-reply", async () => {
+        const res = await this.sendText(phone, replyText);
+        sentId = res?.id || "";
+        return res;
+      });
 
       await sb.from("messages").insert({
         shop_id: shopId,
@@ -912,6 +943,7 @@ export class Session {
         role: "model",
         content: replyText,
         delivery_status: "sent",
+        ...(sentId ? { wa_message_id: sentId } : {}),
       });
     } catch (e: any) {
       console.error(`[call] Failed to send missed call auto-reply to ${phone}:`, e?.message || e);
@@ -1117,6 +1149,45 @@ export class Session {
     if (!jid || jid === "status@broadcast" || jid.endsWith("@g.us") || msg.key.fromMe) return;
 
     const msgId = msg.key.id || "";
+
+    // Check for missed call / unanswered call stub message
+    const stub = (msg as any).messageStubType;
+    const isMissedStub =
+      stub === 40 || // CALL_MISSED_VOICE
+      stub === 41 || // CALL_MISSED_VIDEO
+      stub === 45 || // CALL_MISSED_GROUP_VOICE
+      stub === 46 || // CALL_MISSED_GROUP_VIDEO
+      stub === 169 || // SILENCED_UNKNOWN_CALLER_AUDIO
+      stub === 170 || // SILENCED_UNKNOWN_CALLER_VIDEO
+      stub === proto.WebMessageInfo.StubType.CALL_MISSED_VOICE ||
+      stub === proto.WebMessageInfo.StubType.CALL_MISSED_VIDEO ||
+      stub === proto.WebMessageInfo.StubType.CALL_MISSED_GROUP_VOICE ||
+      stub === proto.WebMessageInfo.StubType.CALL_MISSED_GROUP_VIDEO ||
+      stub === proto.WebMessageInfo.StubType.SILENCED_UNKNOWN_CALLER_AUDIO ||
+      stub === proto.WebMessageInfo.StubType.SILENCED_UNKNOWN_CALLER_VIDEO;
+
+    if (isMissedStub) {
+      if (msgId) {
+        if (this.processedMsgIds.has(msgId)) return;
+        this.processedMsgIds.add(msgId);
+      }
+      // Check message age: ignore stubs older than 3 minutes (e.g. during sync/reconnect)
+      const rawTs = Number(msg.messageTimestamp || 0);
+      const tsMs = rawTs > 1e12 ? rawTs : rawTs * 1000;
+      if (tsMs && Date.now() - tsMs > 3 * 60 * 1000) return;
+
+      const phone = await this.resolveRealNumberAsync(msg);
+      if (phone && phone.length >= 8) {
+        const now = Date.now();
+        const lastReply = this.lastMissedCallReplyAt.get(phone) || 0;
+        if (now - lastReply >= 10 * 60 * 1000) {
+          this.lastMissedCallReplyAt.set(phone, now);
+          console.log(`[call] Missed call stub (${stub}) for ${phone} -> triggering auto-reply`);
+          void this.handleMissedCallAutoReply(phone);
+        }
+      }
+      return;
+    }
 
     // Unwrap envelope types (documentWithCaptionMessage, viewOnceMessage,
     // ephemeralMessage, editedMessage, …) so the real content (e.g. the

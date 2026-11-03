@@ -354,28 +354,40 @@ export class Session {
     return digits;
   }
 
+  /** waId -> highest delivery rank already written (skips duplicate receipts). */
+  private deliveryRankCache = new Map<string, number>();
+
   private async applyDeliveryStatus(
     waId: string,
     next: "sent" | "delivered" | "read",
   ): Promise<void> {
     if (!waId) return;
+    // WhatsApp fires several receipts per message (server ack, delivered, read,
+    // and duplicates from both messages.update and message-receipt.update).
+    // Skip anything that is not an upgrade over what this process already
+    // wrote, so repeated events never touch the database.
+    const nextRank = DELIVERY_RANK[next] || 0;
+    if ((this.deliveryRankCache.get(waId) || 0) >= nextRank) return;
     try {
       const sb = getSupabase();
-      const { data } = await sb
-        .from("messages")
-        .select("id, delivery_status")
-        .eq("shop_id", this.info.shopId)
-        .eq("wa_message_id", waId)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
-      if (!data?.id) return;
-      const cur = String(data.delivery_status || "");
-      if ((DELIVERY_RANK[next] || 0) <= (DELIVERY_RANK[cur] || 0)) return;
-      const { error } = await sb
+      // ONE conditional UPDATE instead of SELECT + UPDATE: only rows whose
+      // status is lower than `next` (or empty) are changed, so a tick can never
+      // move backwards (read -> delivered) and a no-op costs no write.
+      const sameOrHigher = Object.keys(DELIVERY_RANK).filter((s) => (DELIVERY_RANK[s] || 0) >= nextRank);
+      const { data: updatedRows, error } = await sb
         .from("messages")
         .update({ delivery_status: next })
-        .eq("id", data.id);
+        .eq("shop_id", this.info.shopId)
+        .eq("wa_message_id", waId)
+        .or(`delivery_status.is.null,delivery_status.not.in.(${sameOrHigher.join(",")})`)
+        .select("id");
+      if (!error && Array.isArray(updatedRows) && updatedRows.length > 0) {
+        this.deliveryRankCache.set(waId, nextRank);
+        if (this.deliveryRankCache.size > 3000) {
+          const oldest = this.deliveryRankCache.keys().next().value;
+          if (oldest !== undefined) this.deliveryRankCache.delete(oldest);
+        }
+      }
       if (error) {
         console.warn(`[session ${this.info.shopId}] delivery_status ${next} failed:`, error.message);
       }
@@ -1866,16 +1878,25 @@ export class Session {
     }
     
     try {
-      // Fetch the bytes ourselves — more reliable than letting Baileys fetch a
-      // remote URL, which can fail silently on redirects/slow responses.
-      const res = await fetch(imageUrl, { signal: AbortSignal.timeout(MEDIA_FETCH_TIMEOUT_MS) });
-      if (!res.ok) throw new Error(`Failed to fetch image_url: ${res.status}`);
-      const buffer = Buffer.from(await res.arrayBuffer());
+      let buffer: Buffer;
+      if (imageUrl.startsWith("data:image/")) {
+        const commaIdx = imageUrl.indexOf(",");
+        const base64Part = commaIdx >= 0 ? imageUrl.slice(commaIdx + 1) : imageUrl;
+        buffer = Buffer.from(base64Part, "base64");
+      } else {
+        // Fetch the bytes ourselves — more reliable than letting Baileys fetch a
+        // remote URL, which can fail silently on redirects/slow responses.
+        const res = await fetch(imageUrl, { signal: AbortSignal.timeout(MEDIA_FETCH_TIMEOUT_MS) });
+        if (!res.ok) throw new Error(`Failed to fetch image_url: ${res.status}`);
+        buffer = Buffer.from(await res.arrayBuffer());
+      }
       const sent = await this.trackBridgeSend(jid, () =>
         this.sock!.sendMessage(jid, { image: buffer, caption: caption || undefined }),
       );
       const id = sent?.key?.id || "";
-      void this.attachOutgoingWaId(phone, id, imageUrl);
+      if (!imageUrl.startsWith("data:")) {
+        void this.attachOutgoingWaId(phone, id, imageUrl);
+      }
       return { id };
     } catch (err) {
       console.error(`[session ${this.info.shopId}] sendImage fetch failed, falling back to url mode:`, err);
@@ -1883,7 +1904,9 @@ export class Session {
         this.sock!.sendMessage(jid, { image: { url: imageUrl }, caption: caption || undefined }),
       );
       const id = sent?.key?.id || "";
-      void this.attachOutgoingWaId(phone, id, imageUrl);
+      if (!imageUrl.startsWith("data:")) {
+        void this.attachOutgoingWaId(phone, id, imageUrl);
+      }
       return { id };
     }
   }

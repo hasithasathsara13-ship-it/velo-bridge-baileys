@@ -239,6 +239,8 @@ export class Session {
   private lidMapTimer: ReturnType<typeof setTimeout> | null = null;
   private chatJidTimer: ReturnType<typeof setTimeout> | null = null;
   private processedMsgIds = new Set<string>();
+  /** Fast in-memory map of WhatsApp message id -> image URL for instant quoted message resolution */
+  private sentImageUrls = new Map<string, string>();
   // Remember the exact jid a phone number last messaged from (handles @lid
   // contacts that can only be reached via their lid jid, not phone@s.whatsapp.net).
   private phoneToChatJid = new Map<string, string>();
@@ -1211,10 +1213,27 @@ export class Session {
       let quotedText: string | undefined;
       let color: string | undefined;
 
-      const isImageContent = Boolean(quotedRow?.content && /^https?:\/\//i.test(quotedRow.content));
+      if (quotedRow?.content && /^https?:\/\//i.test(quotedRow.content)) {
+        imageUrl = quotedRow.content.trim();
+      } else if (this.sentImageUrls.has(waId)) {
+        imageUrl = this.sentImageUrls.get(waId);
+      }
 
-      if (isImageContent) {
-        imageUrl = quotedRow!.content.trim();
+      if (imageUrl) {
+        if (!replyToId) {
+          try {
+            const { data: rowByUrl } = await sb
+              .from("messages")
+              .select("id")
+              .eq("shop_id", shopId)
+              .eq("content", imageUrl)
+              .order("created_at", { ascending: false })
+              .limit(1)
+              .maybeSingle();
+            if (rowByUrl?.id) replyToId = rowByUrl.id;
+          } catch {}
+        }
+
         try {
           const { data: prods } = await sb
             .from("products")
@@ -1483,7 +1502,10 @@ export class Session {
         content.imageMessage?.contextInfo ||
         content.videoMessage?.contextInfo ||
         content.audioMessage?.contextInfo ||
-        content.documentMessage?.contextInfo;
+        content.documentMessage?.contextInfo ||
+        (msg.message as any)?.extendedTextMessage?.contextInfo ||
+        (msg.message as any)?.imageMessage?.contextInfo ||
+        (msg.message as any)?.contextInfo;
       const quotedContext = await this.resolveQuotedMessageContext(shopId, contextInfo);
 
       // Anti-ban bookkeeping: this person wrote to us (makes them eligible for
@@ -1723,7 +1745,10 @@ export class Session {
       content.imageMessage?.contextInfo ||
       content.videoMessage?.contextInfo ||
       content.audioMessage?.contextInfo ||
-      content.documentMessage?.contextInfo;
+      content.documentMessage?.contextInfo ||
+      (msg.message as any)?.extendedTextMessage?.contextInfo ||
+      (msg.message as any)?.imageMessage?.contextInfo ||
+      (msg.message as any)?.contextInfo;
     const quotedContext = await this.resolveQuotedMessageContext(shopId, contextInfo);
 
     await sb.from("customers").upsert(
@@ -2288,6 +2313,13 @@ export class Session {
         this.sock!.sendMessage(jid, { image: buffer, caption: caption || undefined }),
       );
       const id = sent?.key?.id || "";
+      if (id && imageUrl) {
+        this.sentImageUrls.set(id, imageUrl);
+        if (this.sentImageUrls.size > 1000) {
+          const oldest = this.sentImageUrls.keys().next().value;
+          if (oldest !== undefined) this.sentImageUrls.delete(oldest);
+        }
+      }
       if (!imageUrl.startsWith("data:")) {
         void this.attachOutgoingWaId(phone, id, imageUrl);
       }
@@ -2298,6 +2330,13 @@ export class Session {
         this.sock!.sendMessage(jid, { image: { url: imageUrl }, caption: caption || undefined }),
       );
       const id = sent?.key?.id || "";
+      if (id && imageUrl) {
+        this.sentImageUrls.set(id, imageUrl);
+        if (this.sentImageUrls.size > 1000) {
+          const oldest = this.sentImageUrls.keys().next().value;
+          if (oldest !== undefined) this.sentImageUrls.delete(oldest);
+        }
+      }
       if (!imageUrl.startsWith("data:")) {
         void this.attachOutgoingWaId(phone, id, imageUrl);
       }

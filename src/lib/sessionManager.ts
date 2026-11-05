@@ -1752,7 +1752,7 @@ export class Session {
           }
         }
         // Then each product as a single photo+caption message, 1-2s apart.
-        for (const card of captionedImages.slice(0, 8)) {
+        for (const card of captionedImages.slice(0, 10)) {
           if (await this.sendReplyPiece(phone, "product card", () => this.sendImage(phone, card.url as string, (card.caption || "").trim() || undefined))) {
             await randomDelay(1200, 2200);
           }
@@ -1792,7 +1792,7 @@ export class Session {
       }
 
       // 2. Send images (product photos) second
-      for (const url of images.slice(0, 6)) {
+      for (const url of images.slice(0, 10)) {
         if (await this.sendReplyPiece(phone, "image", () => this.sendImage(phone, url))) {
           await randomDelay(1000, 2000);
         }

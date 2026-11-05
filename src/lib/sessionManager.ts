@@ -1743,11 +1743,12 @@ export class Session {
       // Greeting / lead text goes out FIRST, then captioned showcase product cards,
       // and finally any AI reply answering a first-contact question (e.g. courier charge or pack price).
       if (captionedImages.length > 0) {
-        const leadBubbles = greetingBubbles.length > 0 ? greetingBubbles : replyBubbles;
-        for (const b of leadBubbles.slice(0, MAX_BOT_BUBBLES)) {
-          if (!b.trim()) continue;
-          if (await this.sendReplyPiece(phone, "greeting text", () => this.sendText(phone, b))) {
-            await randomDelay(800, 1500);
+        if (greetingBubbles.length > 0) {
+          for (const b of greetingBubbles.slice(0, MAX_BOT_BUBBLES)) {
+            if (!b.trim()) continue;
+            if (await this.sendReplyPiece(phone, "greeting text", () => this.sendText(phone, b))) {
+              await randomDelay(800, 1500);
+            }
           }
         }
         // Then each product as a single photo+caption message, 1-2s apart.
@@ -1764,9 +1765,8 @@ export class Session {
           }
         }
 
-        // If the customer also asked a question on first contact (e.g. courier charge or specific pack price),
-        // send the AI answer bubble(s) AFTER the greeting and showcase products!
-        if (greetingBubbles.length > 0 && replyBubbles.length > 0) {
+        // Send any reply bubble(s) AFTER the captioned images!
+        if (replyBubbles.length > 0) {
           for (const b of replyBubbles.slice(0, MAX_BOT_BUBBLES)) {
             if (!b.trim()) continue;
             if (await this.sendReplyPiece(phone, "reply text", () => this.sendText(phone, b))) {

@@ -34,6 +34,16 @@ const MAX_BOT_BUBBLES = 8;
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+interface QuotedContextResult {
+  replyToId: string | null;
+  replySnippet: string | null;
+  productName?: string;
+  imageIndex?: number;
+  totalImages?: number;
+  imageUrl?: string;
+  quotedText?: string;
+}
+
 export type SessionStatus = "disconnected" | "connecting" | "qr" | "connected";
 
 export interface SessionInfo {
@@ -1144,6 +1154,103 @@ export class Session {
     return "";
   }
 
+  private async resolveQuotedMessageContext(
+    shopId: string,
+    contextInfo: proto.IContextInfo | null | undefined,
+  ): Promise<QuotedContextResult | null> {
+    if (!contextInfo?.stanzaId) return null;
+    const waId = String(contextInfo.stanzaId).trim();
+    if (!waId) return null;
+
+    try {
+      const sb = getSupabase();
+      const { data: quotedRow } = await sb
+        .from("messages")
+        .select("id, content, role, reply_snippet")
+        .eq("shop_id", shopId)
+        .eq("wa_message_id", waId)
+        .order("created_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      let replyToId: string | null = quotedRow?.id || null;
+      let replySnippet: string | null = null;
+      let productName: string | undefined;
+      let imageIndex: number | undefined;
+      let totalImages: number | undefined;
+      let imageUrl: string | undefined;
+      let quotedText: string | undefined;
+
+      const isImageContent = Boolean(quotedRow?.content && /^https?:\/\//i.test(quotedRow.content));
+
+      if (isImageContent) {
+        imageUrl = quotedRow!.content.trim();
+        try {
+          const { data: prods } = await sb
+            .from("products")
+            .select("id, name, images")
+            .eq("shop_id", shopId)
+            .eq("is_active", true);
+
+          if (prods && prods.length > 0) {
+            for (const prod of prods) {
+              const rawImages = Array.isArray(prod.images)
+                ? prod.images
+                : (typeof prod.images === "string"
+                    ? prod.images.replace(/[{}]/g, "").split(",").map((s: string) => s.trim().replace(/^"|"$/g, ""))
+                    : []);
+              const matchIdx = rawImages.findIndex((imgUrl: string) =>
+                imgUrl && imageUrl && (imgUrl === imageUrl || imgUrl.includes(imageUrl) || imageUrl.includes(imgUrl))
+              );
+              if (matchIdx >= 0) {
+                productName = prod.name;
+                imageIndex = matchIdx + 1;
+                totalImages = rawImages.length;
+                break;
+              }
+            }
+          }
+        } catch (prodErr) {
+          console.warn(`[quoted] product lookup failed for shop ${shopId}:`, prodErr);
+        }
+
+        if (productName) {
+          replySnippet = `📷 Photo ${imageIndex} of ${productName}${totalImages ? ` (${imageIndex}/${totalImages})` : ""}`;
+        } else {
+          replySnippet = "📷 Photo";
+        }
+      } else if (quotedRow?.content) {
+        quotedText = quotedRow.content;
+        replySnippet = quotedRow.content.slice(0, 100);
+      } else {
+        const qm = contextInfo.quotedMessage;
+        if (qm?.imageMessage) {
+          const cap = qm.imageMessage.caption?.trim();
+          replySnippet = cap ? `📷 ${cap.slice(0, 100)}` : "📷 Photo";
+          quotedText = cap || "Photo";
+        } else if (qm?.conversation || qm?.extendedTextMessage?.text) {
+          const txt = (qm.conversation || qm.extendedTextMessage?.text || "").trim();
+          quotedText = txt;
+          replySnippet = txt.slice(0, 100);
+        }
+      }
+
+      console.log(`[quoted] resolved quoted msg for waId=${waId}: snippet="${replySnippet}", prod="${productName || "-"}", idx=${imageIndex || "-"}`);
+      return {
+        replyToId,
+        replySnippet,
+        productName,
+        imageIndex,
+        totalImages,
+        imageUrl,
+        quotedText,
+      };
+    } catch (err) {
+      console.warn(`[quoted] error resolving quoted message for wa_id ${waId}:`, err);
+      return null;
+    }
+  }
+
   private async handleIncoming(msg: WAMessage): Promise<void> {
     const jid = msg.key.remoteJid || "";
     if (!jid || jid === "status@broadcast" || jid.endsWith("@g.us") || msg.key.fromMe) return;
@@ -1336,6 +1443,14 @@ export class Session {
 
       if (!textContent) return;
 
+      const contextInfo =
+        content.extendedTextMessage?.contextInfo ||
+        content.imageMessage?.contextInfo ||
+        content.videoMessage?.contextInfo ||
+        content.audioMessage?.contextInfo ||
+        content.documentMessage?.contextInfo;
+      const quotedContext = await this.resolveQuotedMessageContext(shopId, contextInfo);
+
       // Anti-ban bookkeeping: this person wrote to us (makes them eligible for
       // follow-ups, and lets us honour "stop"), and remember the message key so
       // the bot can mark it read before replying, like a human would.
@@ -1354,22 +1469,29 @@ export class Session {
 
       const row: Record<string, unknown> = { shop_id: shopId, phone_number: phone, role: "user", content: textContent };
       if (msgId) row.wa_message_id = msgId;
+      if (quotedContext?.replyToId) row.reply_to_id = quotedContext.replyToId;
+      if (quotedContext?.replySnippet) row.reply_snippet = quotedContext.replySnippet;
       await sb.from("messages").insert(row);
 
       // Text sent to the bot: the caption for media, or the plain text body otherwise.
-      const textForBot = isMedia && !mediaType ? "" : (caption.trim() || textContent);
+      const rawTextForBot = isMedia && !mediaType ? "" : (caption.trim() || textContent);
+      const textForBot = quotedContext?.replySnippet
+        ? `[Replying to: ${quotedContext.replySnippet}] ${rawTextForBot}`
+        : rawTextForBot;
+
       if (isMedia) {
         this.queueMediaBotBurst(shopId, phone, {
           text: textForBot,
           mediaType,
           mediaUrl,
           messageId: msgId || null,
+          quotedContext,
         });
       } else if (textForBot || mediaType) {
         if (this.isRepeatedAutoText(phone, textForBot)) {
           console.warn(`[bot] no AI call for ${phone}: the same long message arrived 3+ times in 30 min (likely another bot's auto-reply)`);
         } else {
-          this.triggerBot(shopId, phone, textForBot, mediaType, mediaUrl, msgId || null).catch(
+          this.triggerBot(shopId, phone, textForBot, mediaType, mediaUrl, msgId || null, quotedContext).catch(
             (e) => console.error("[bot]", e),
           );
         }
@@ -1419,6 +1541,7 @@ export class Session {
       mediaType: "audio" | "image" | "document" | null;
       mediaUrl: string | null;
       messageId: string | null;
+      quotedContext?: QuotedContextResult | null;
     } | null;
   }>();
 
@@ -1451,6 +1574,7 @@ export class Session {
       mediaType: "audio" | "image" | "document" | null;
       mediaUrl: string | null;
       messageId: string | null;
+      quotedContext?: QuotedContextResult | null;
     },
   ): void {
     const burst = this.mediaBotBursts.get(this.mediaBurstKey(shopId, phone));
@@ -1488,6 +1612,7 @@ export class Session {
         pending.mediaType,
         pending.mediaUrl,
         pending.messageId,
+        pending.quotedContext || null,
       ).catch((e) => console.error("[bot]", e));
     }, Session.MEDIA_BOT_BURST_MS);
   }
@@ -1558,12 +1683,20 @@ export class Session {
 
     if (!textContent) return;
 
+    const contextInfo =
+      content.extendedTextMessage?.contextInfo ||
+      content.imageMessage?.contextInfo ||
+      content.videoMessage?.contextInfo ||
+      content.audioMessage?.contextInfo ||
+      content.documentMessage?.contextInfo;
+    const quotedContext = await this.resolveQuotedMessageContext(shopId, contextInfo);
+
     await sb.from("customers").upsert(
       { shop_id: shopId, phone_number: phone, bot_active: true },
       { onConflict: "shop_id,phone_number", ignoreDuplicates: true },
     );
 
-      const row: Record<string, unknown> = {
+    const row: Record<string, unknown> = {
       shop_id: shopId,
       phone_number: phone,
       role: "admin",
@@ -1571,6 +1704,8 @@ export class Session {
       delivery_status: "sent",
     };
     if (msgId) row.wa_message_id = msgId;
+    if (quotedContext?.replyToId) row.reply_to_id = quotedContext.replyToId;
+    if (quotedContext?.replySnippet) row.reply_snippet = quotedContext.replySnippet;
     await sb.from("messages").insert(row);
     // Deliberately no triggerBot call — an owner's manual message must never
     // cause an automated bot reply.
@@ -1610,7 +1745,15 @@ export class Session {
   private botSeq = new Map<string, number>();
   private botSeqCounter = 0;
 
-  private triggerBot(shopId: string, phone: string, text: string, mediaType: "audio" | "image" | "document" | null, mediaUrl: string | null, messageId: string | null = null): Promise<void> {
+  private triggerBot(
+    shopId: string,
+    phone: string,
+    text: string,
+    mediaType: "audio" | "image" | "document" | null,
+    mediaUrl: string | null,
+    messageId: string | null = null,
+    quotedContext: QuotedContextResult | null = null,
+  ): Promise<void> {
     const key = `${shopId}:${phone}`;
     const seq = ++this.botSeqCounter;
     this.botSeq.set(key, seq);
@@ -1634,7 +1777,7 @@ export class Session {
           console.warn(`[bot] no AI call for ${phone}: reply would be blocked (${blocked})`);
           return;
         }
-        await withTimeout(this.runBotTurn(shopId, phone, text, mediaType, mediaUrl, messageId), BOT_TURN_WATCHDOG_MS, undefined);
+        await withTimeout(this.runBotTurn(shopId, phone, text, mediaType, mediaUrl, messageId, quotedContext), BOT_TURN_WATCHDOG_MS, undefined);
       } finally {
         this.releaseBotSlot();
         if (this.botSeq.get(key) === seq) this.botSeq.delete(key);
@@ -1651,7 +1794,7 @@ export class Session {
   /** POST to the frontend bot. Retries only when the endpoint fails FAST
    *  (connection error, 5xx, 429). A timeout is never retried: the original
    *  request may still be running server-side and a retry could double-reply. */
-  private async callBotWithRetry(url: string, secret: string, payload: Record<string, string>): Promise<Response | null> {
+  private async callBotWithRetry(url: string, secret: string, payload: Record<string, unknown>): Promise<Response | null> {
     let res: Response | null = null;
     for (let attempt = 0; ; attempt++) {
       try {
@@ -1667,10 +1810,10 @@ export class Session {
         // would pay for them again (up to 3x) — those are not retried.
         const retryable = res.status === 429 || res.status === 502 || res.status === 503;
         if (!retryable) return res;
-        console.warn(`[bot] endpoint returned ${res.status} (attempt ${attempt + 1}) for ${payload.phone_number}`);
+        console.warn(`[bot] endpoint returned ${res.status} (attempt ${attempt + 1}) for ${String(payload.phone_number || "")}`);
       } catch (e) {
         const timedOut = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError");
-        console.warn(`[bot] request failed (attempt ${attempt + 1}) for ${payload.phone_number}:`, (e as Error)?.message || e);
+        console.warn(`[bot] request failed (attempt ${attempt + 1}) for ${String(payload.phone_number || "")}:`, (e as Error)?.message || e);
         res = null;
         if (timedOut) return null;
       }
@@ -1680,19 +1823,30 @@ export class Session {
     }
   }
 
-  private async runBotTurn(shopId: string, phone: string, text: string, mediaType: "audio" | "image" | "document" | null, mediaUrl: string | null, messageId: string | null = null): Promise<void> {
+  private async runBotTurn(
+    shopId: string,
+    phone: string,
+    text: string,
+    mediaType: "audio" | "image" | "document" | null,
+    mediaUrl: string | null,
+    messageId: string | null = null,
+    quotedContext: QuotedContextResult | null = null,
+  ): Promise<void> {
     const frontendUrl = process.env.FRONTEND_URL?.trim();
     const bridgeSecret = process.env.BRIDGE_SECRET?.trim() || "";
     if (!frontendUrl) return;
 
     try {
-      const payload: Record<string, string> = { shop_id: shopId, phone_number: phone, text };
+      const payload: Record<string, unknown> = { shop_id: shopId, phone_number: phone, text };
       // Pass the WhatsApp message id so /api/wa-web-bot can deduplicate retried
       // or duplicate deliveries of the same message (idempotency guard).
       if (messageId) payload.message_id = messageId;
       if (mediaType && mediaUrl) {
         payload.media_type = mediaType;
         payload.media_url = mediaUrl;
+      }
+      if (quotedContext) {
+        payload.quoted_context = quotedContext;
       }
 
       const res = await this.callBotWithRetry(`${frontendUrl}/api/wa-web-bot`, bridgeSecret, payload);

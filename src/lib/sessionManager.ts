@@ -42,7 +42,36 @@ interface QuotedContextResult {
   totalImages?: number;
   imageUrl?: string;
   quotedText?: string;
+  color?: string;
 }
+
+/** Pre-mapped color variants per product photo (1-based index) */
+const PRODUCT_IMAGE_COLORS: Record<string, string[]> = {
+  "bag design 1": [
+    "Dark Brown (තද දුඹුරු)",
+    "Black (කළු)",
+    "Beige / Cream (ක්‍රීම් / බේජ්)",
+    "Tan Brown (ටෑන් දුඹුරු)",
+    "Olive Grey (ඔලිව් අළු)",
+    "Navy Blue (තද නිල්)",
+    "Rose Pink (රෝස)",
+    "Light Grey (ලා අළු)",
+    "Maroon (මැරූන්)",
+    "Mocha Brown (මෝකා දුඹුරු)",
+  ],
+  "bag design 2": [
+    "Beige / Cream (ක්‍රීම් / බේජ්)",
+    "Maroon (මැරූන්)",
+    "Rose Pink (රෝස)",
+    "Dark Brown (තද දුඹුරු)",
+    "Black (කළු)",
+    "Magenta Pink (මැජෙන්ටා රෝස)",
+    "Light Ash / Grey (ලා අළු)",
+    "Dark Grey (තද අළු)",
+    "Navy Blue (තද නිල්)",
+    "Mocha Brown (මෝකා දුඹුරු)",
+  ],
+};
 
 export type SessionStatus = "disconnected" | "connecting" | "qr" | "connected";
 
@@ -1180,6 +1209,7 @@ export class Session {
       let totalImages: number | undefined;
       let imageUrl: string | undefined;
       let quotedText: string | undefined;
+      let color: string | undefined;
 
       const isImageContent = Boolean(quotedRow?.content && /^https?:\/\//i.test(quotedRow.content));
 
@@ -1215,7 +1245,11 @@ export class Session {
         }
 
         if (productName) {
-          replySnippet = `📷 Photo ${imageIndex} of ${productName}${totalImages ? ` (${imageIndex}/${totalImages})` : ""}`;
+          const normName = productName.toLowerCase().trim();
+          const colorList = PRODUCT_IMAGE_COLORS[normName];
+          color = (imageIndex && colorList && colorList[imageIndex - 1]) ? colorList[imageIndex - 1] : undefined;
+          const colorLabel = color ? ` (${color})` : "";
+          replySnippet = `📷 Photo ${imageIndex}${colorLabel} of ${productName}${totalImages ? ` (${imageIndex}/${totalImages})` : ""}`;
         } else {
           replySnippet = "📷 Photo";
         }
@@ -1244,6 +1278,7 @@ export class Session {
         totalImages,
         imageUrl,
         quotedText,
+        color,
       };
     } catch (err) {
       console.warn(`[quoted] error resolving quoted message for wa_id ${waId}:`, err);

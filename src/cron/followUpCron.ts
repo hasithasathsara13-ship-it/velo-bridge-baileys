@@ -42,7 +42,15 @@ const TOPIC_PATTERNS: Array<[Topic, RegExp]> = [
   ["details", /\b(?:details?|info|ingredients?|material|fabric|suit\w*|hodama|best|recommend\w*|wistara\w*|wisthara\w*|visthara\w*|benefits?|how to use|sakas|hadana)\b|විස්තර|දැනගැනීමට|හදන|සකස්|භාවිතා|ගුණ|ප්‍රතිඵල/iu],
 ];
 
-const NAME_STOP = new Set(["the", "and", "for", "with", "new", "powder", "bags", "bag", "instant", "natural", "products", "item", "pack"]);
+const GENERIC_CATEGORY_STOP = new Set([
+  "the", "and", "for", "with", "new", "powder", "bags", "bag", "handbag", "handbags",
+  "instant", "natural", "products", "product", "item", "items", "pack", "packs", "pcs",
+  "short", "shorts", "bra", "bras", "panties", "panty", "skinny", "skinnies",
+  "dress", "dresses", "shirt", "shirts", "tshirt", "tshirts", "t-shirt", "t-shirts",
+  "cotton", "ladies", "unisex", "men", "mens", "women", "womens",
+  "size", "sizes", "colour", "colours", "color", "colors", "material", "quality",
+  "necklace", "necklaces", "bracelet", "bracelets", "earring", "earrings", "anklet", "anklets", "ring", "rings", "jewellery", "jewelry"
+]);
 const STALE_WINDOW_MS = 72 * 3_600_000; // > 72h -> WhatsApp spam risk
 const FOLLOWUP_COOLDOWN_MS = 3 * 24 * 3_600_000; // 3 days
 const BUYING_TOPICS = new Set<Topic>(["price", "size", "colour", "delivery", "availability"]);
@@ -68,20 +76,77 @@ export function extractProductAliases(p: FollowUpProduct): string[] {
 }
 
 export function mentionsProduct<T extends FollowUpProduct>(text: string, products: T[]): T | null {
-  const hay = text.toLowerCase();
-  if (!hay.trim() || !products.length) return null;
+  const hay = text.toLowerCase().trim();
+  if (!hay || !products.length) return null;
+
+  let best: { product: T; score: number } | null = null;
+
   for (const product of products) {
     const fullName = product.name.trim().toLowerCase();
-    if (fullName && hay.includes(fullName)) return product;
-    const aliases = extractProductAliases(product);
-    for (const alias of aliases) {
-      if (alias.length >= 3 && hay.includes(alias)) return product;
+    const cleanName = fullName.replace(/[\p{Extended_Pictographic}\u200d\ufe0f]/gu, "").replace(/\s+/g, " ").trim();
+
+    // 1. Exact full product name match (highest precedence)
+    if (cleanName && hay.includes(cleanName)) {
+      const score = 1000 + cleanName.length;
+      if (!best || score > best.score) best = { product, score };
+      continue;
     }
-    const allTokens = aliases.flatMap((a) => (a.match(/[\p{L}\p{N}]+/gu) ?? []).filter((t) => t.length >= 3 && !NAME_STOP.has(t)));
-    const hits = allTokens.filter((t) => hay.includes(t) || (t.length > 4 && t.endsWith("s") && hay.includes(t.slice(0, -1)))).length;
-    if (hits >= 1) return product;
+
+    // 2. Exact match with plural / singular suffix (e.g. "rib shorts" vs "rib short")
+    if (cleanName.endsWith("s") && hay.includes(cleanName.slice(0, -1))) {
+      const score = 950 + cleanName.length;
+      if (!best || score > best.score) best = { product, score };
+      continue;
+    }
+    if (!cleanName.endsWith("s") && hay.includes(cleanName + "s")) {
+      const score = 950 + cleanName.length;
+      if (!best || score > best.score) best = { product, score };
+      continue;
+    }
+
+    // 3. Direct alias match from bracketed descriptions or Sinhala/Tamil names
+    const aliases = extractProductAliases(product);
+    let matchedAlias = false;
+    for (const alias of aliases) {
+      if (alias.length >= 4 && !GENERIC_CATEGORY_STOP.has(alias) && hay.includes(alias)) {
+        const score = 500 + alias.length;
+        if (!best || score > best.score) best = { product, score };
+        matchedAlias = true;
+        break;
+      }
+    }
+    if (matchedAlias) continue;
+
+    // 4. Token matching: require at least one DISTINCTIVE (non-category) token!
+    // Generic tokens like "short", "bra", "bag" alone CANNOT trigger a product match.
+    const tokens = (cleanName.match(/[\p{L}\p{N}]+/gu) ?? []).filter((t) => t.length >= 3);
+    const distinctiveTokens = tokens.filter((t) => !GENERIC_CATEGORY_STOP.has(t));
+    const categoryTokens = tokens.filter((t) => GENERIC_CATEGORY_STOP.has(t));
+
+    // Must match at least one distinctive token (e.g. "rib", "dolphin", "popcorn", "heringbone", "clover")
+    let distinctiveHits = 0;
+    for (const dt of distinctiveTokens) {
+      if (hay.includes(dt) || (dt.length > 4 && dt.endsWith("s") && hay.includes(dt.slice(0, -1)))) {
+        distinctiveHits++;
+      }
+    }
+
+    if (distinctiveHits > 0) {
+      let categoryHits = 0;
+      for (const ct of categoryTokens) {
+        if (hay.includes(ct) || (ct.length > 4 && ct.endsWith("s") && hay.includes(ct.slice(0, -1)))) {
+          categoryHits++;
+        }
+      }
+      const score = distinctiveHits * 100 + categoryHits * 5;
+      if (!best || score > best.score) {
+        best = { product, score };
+      }
+    }
   }
-  return null;
+
+  // Only return if score meets threshold (at least one distinctive token or alias/full match)
+  return best && best.score >= 100 ? best.product : null;
 }
 
 export function customerShowedProductInterest(customerTexts: string[], products: FollowUpProduct[] = []): boolean {

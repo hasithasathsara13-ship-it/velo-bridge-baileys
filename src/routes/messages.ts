@@ -50,7 +50,9 @@ messageRouter.post("/send-text", async (req: Request, res: Response) => {
       const queued = await session.queueProactive(phone_number, message);
       return res.status(202).json({ ok: true, queued: true, position: queued.position });
     }
-    const result = await session.sendText(phone_number, message, true, HTTP_SEND_OPTS);
+    // Admin sends: fast dispatch without artificial typing delay unless specifically requested
+    const showTyping = (req.body as { show_typing?: boolean }).show_typing === true;
+    const result = await session.sendText(phone_number, message, showTyping, HTTP_SEND_OPTS);
     // NOTE: we deliberately do NOT insert into `messages` here.
     // Admin-initiated sends are already persisted by the frontend, so inserting
     // again would show the message twice in the chat interface.
@@ -78,7 +80,8 @@ messageRouter.post("/send-image", async (req: Request, res: Response) => {
   }
 
   try {
-    const result = await session.sendImage(phone_number, image_url, caption, true, HTTP_SEND_OPTS);
+    const showTyping = (req.body as { show_typing?: boolean }).show_typing === true;
+    const result = await session.sendImage(phone_number, image_url, caption, showTyping, HTTP_SEND_OPTS);
     // Frontend persists admin-sent media itself — no insert here (avoids duplicates).
     res.json({ ok: true, id: result.id, wa_message_id: result.id });
   } catch (err: unknown) {
@@ -106,11 +109,12 @@ messageRouter.post("/send-audio", async (req: Request, res: Response) => {
   }
 
   try {
+    const showTyping = (req.body as { show_typing?: boolean }).show_typing === true;
     const result = await session.sendAudio(phone_number, {
       url: audio_url,
       base64: audio_base64,
       mimetype: mimetype || "audio/ogg; codecs=opus",
-    }, true, HTTP_SEND_OPTS);
+    }, showTyping, HTTP_SEND_OPTS);
     // Frontend persists admin-sent voice itself — no insert here (avoids duplicates).
     res.json({ ok: true, id: result.id, wa_message_id: result.id });
   } catch (err: unknown) {

@@ -49,7 +49,8 @@ const GENERIC_CATEGORY_STOP = new Set([
   "dress", "dresses", "shirt", "shirts", "tshirt", "tshirts", "t-shirt", "t-shirts",
   "cotton", "ladies", "unisex", "men", "mens", "women", "womens",
   "size", "sizes", "colour", "colours", "color", "colors", "material", "quality",
-  "necklace", "necklaces", "bracelet", "bracelets", "earring", "earrings", "anklet", "anklets", "ring", "rings", "jewellery", "jewelry"
+  "necklace", "necklaces", "bracelet", "bracelets", "earring", "earrings", "anklet", "anklets", "ring", "rings", "jewellery", "jewelry",
+  "inch", "inches", "free", "normal", "set", "piece", "pieces", "black", "white", "pink", "blue", "red", "green", "grey", "gray"
 ]);
 const STALE_WINDOW_MS = 72 * 3_600_000; // > 72h -> WhatsApp spam risk
 const FOLLOWUP_COOLDOWN_MS = 3 * 24 * 3_600_000; // 3 days
@@ -58,21 +59,67 @@ const BUYING_TOPICS = new Set<Topic>(["price", "size", "colour", "delivery", "av
 export function extractProductAliases(p: FollowUpProduct): string[] {
   const aliases: string[] = [p.name.trim().toLowerCase()];
   const desc = p.description || "";
+
+  // 1. Bracketed expressions in description and name e.g. (කොහිල කැඳ), (කුරක්කන් කැඳ), (Ladies Panties V Cut), (සරම්)
   if (desc) {
     for (const m of desc.matchAll(/\(([^)]+)\)/g)) {
       const raw = m[1].trim();
-      if (raw.length >= 2 && raw.length <= 50 && !/^(?:cod|easy method|traditional method|taste tips|\d+)/i.test(raw)) {
+      if (raw.length >= 2 && raw.length <= 50 && !/^(?:cod|easy method|traditional method|taste tips|waist|size|\d+)/i.test(raw)) {
         aliases.push(raw.toLowerCase());
       }
     }
   }
+
   for (const m of p.name.matchAll(/\(([^)]+)\)/g)) {
     const raw = m[1].trim();
     if (raw.length >= 2 && raw.length <= 50) {
       aliases.push(raw.toLowerCase());
     }
   }
-  return [...new Set(aliases)];
+
+  // 2. First line / title before newline or emojis, if short & clean
+  if (desc) {
+    const firstLine = desc.split("\n")[0].replace(/[🌿🔥⚡🍃💚✔️✅💵🥣\d–—\-\/]+/gu, " ").trim();
+    if (firstLine.length >= 3 && firstLine.length <= 40 && !firstLine.includes(":") && !firstLine.includes("pack")) {
+      aliases.push(firstLine.toLowerCase());
+    }
+  }
+
+  // 3. Known apparel shorthands, common customer typos, and Sinhala translations
+  const lower = p.name.toLowerCase();
+  if (lower.includes("rib short")) {
+    aliases.push("rib short", "rib shorts", "rb short", "rb shorts", "rib", "රිබ්", "රිබ් ෂෝට්");
+  } else if (lower.includes("pop corn") || lower.includes("popcorn")) {
+    aliases.push("popcorn", "pop corn", "popcorn short", "popcorn shorts", "pop corn short", "පොප්කෝන්");
+  } else if (lower.includes("15 inches") || lower.includes("15\"")) {
+    aliases.push("cotton 15", "15 short", "15 shorts", "15 inches short", "15 inches", "15 inch", "15\"", "15 ෂෝට්");
+  } else if (lower.includes("17 inches") || lower.includes("17\"")) {
+    aliases.push("17 short", "17 shorts", "17 inches short", "17 inches", "17 inch", "17\"", "17 ෂෝට්");
+  } else if (lower.includes("dolphin")) {
+    aliases.push("dolphin short", "dolphin shorts", "dolphin", "ඩොල්ෆින්");
+  } else if (lower.includes("tight short")) {
+    aliases.push("tight short", "tight shorts", "tight", "ටයිට්");
+  } else if (lower.includes("skirt")) {
+    aliases.push("skirt", "skirts", "සාය", "සායවල්");
+  } else if (lower.includes("skinny")) {
+    aliases.push("ladies skinny", "skinny", "skinnies", "arm cut", "arm-cut", "armcut", "ස්කිනි");
+  } else if (lower.includes("v cut") || lower.includes("v-cut")) {
+    aliases.push("v cut", "v-cut", "vcut", "v cut panties", "ladies panties v cut", "v cut panty");
+  } else if (lower.includes("box panties")) {
+    aliases.push("box panties", "box panty", "boxer", "boxers", "බොක්ස් පෑන්ටි");
+  } else if (lower.includes("strechble bra") || lower.includes("stretchable bra")) {
+    aliases.push("strechble bra", "stretchable bra", "stretch bra");
+  } else if (lower.includes("non padded") || lower.includes("normal bra")) {
+    aliases.push("non padded bra", "non-padded bra", "normal bra");
+  } else if (lower.includes("sport bra") || lower.includes("sports bra")) {
+    aliases.push("sport bra", "sports bra");
+  } else if (lower.includes("padded bra")) {
+    aliases.push("padded bra");
+  } else if (lower.includes("saron") || lower.includes("sarong")) {
+    aliases.push("saron", "sarong", "sarom", "සරම්", "සරම");
+  }
+
+  return [...new Set(aliases.map((a) => a.toLowerCase().trim()).filter(Boolean))];
 }
 
 export function mentionsProduct<T extends FollowUpProduct>(text: string, products: T[]): T | null {
@@ -104,21 +151,28 @@ export function mentionsProduct<T extends FollowUpProduct>(text: string, product
       continue;
     }
 
-    // 3. Direct alias match from bracketed descriptions or Sinhala/Tamil names
+    // 3. Direct alias match from bracketed descriptions, shorthand, or Sinhala/Tamil names
     const aliases = extractProductAliases(product);
     let matchedAlias = false;
     for (const alias of aliases) {
-      if (alias.length >= 4 && !GENERIC_CATEGORY_STOP.has(alias) && hay.includes(alias)) {
-        const score = 500 + alias.length;
-        if (!best || score > best.score) best = { product, score };
-        matchedAlias = true;
-        break;
+      if (alias.length >= 3 && !GENERIC_CATEGORY_STOP.has(alias)) {
+        const isWordMatch =
+          alias.length <= 4
+            ? new RegExp(`(^|[^a-z0-9])${alias}([^a-z0-9]|$)`, "i").test(hay)
+            : hay.includes(alias);
+
+        if (isWordMatch) {
+          const score = 500 + alias.length;
+          if (!best || score > best.score) best = { product, score };
+          matchedAlias = true;
+          break;
+        }
       }
     }
     if (matchedAlias) continue;
 
     // 4. Token matching: require at least one DISTINCTIVE (non-category) token!
-    // Generic tokens like "short", "bra", "bag" alone CANNOT trigger a product match.
+    // Generic tokens like "short", "bra", "bag", "inches" alone CANNOT trigger a product match.
     const tokens = (cleanName.match(/[\p{L}\p{N}]+/gu) ?? []).filter((t) => t.length >= 3);
     const distinctiveTokens = tokens.filter((t) => !GENERIC_CATEGORY_STOP.has(t));
     const categoryTokens = tokens.filter((t) => GENERIC_CATEGORY_STOP.has(t));
@@ -126,8 +180,12 @@ export function mentionsProduct<T extends FollowUpProduct>(text: string, product
     // Must match at least one distinctive token (e.g. "rib", "dolphin", "popcorn", "heringbone", "clover")
     let distinctiveHits = 0;
     for (const dt of distinctiveTokens) {
-      if (hay.includes(dt) || (dt.length > 4 && dt.endsWith("s") && hay.includes(dt.slice(0, -1)))) {
-        distinctiveHits++;
+      if (dt.length <= 4) {
+        if (new RegExp(`(^|[^a-z0-9])${dt}([^a-z0-9]|$)`, "i").test(hay)) distinctiveHits++;
+      } else {
+        if (hay.includes(dt) || (dt.endsWith("s") && hay.includes(dt.slice(0, -1)))) {
+          distinctiveHits++;
+        }
       }
     }
 
@@ -182,9 +240,42 @@ export function displayName(product: FollowUpProduct): string {
   return product.name.replace(/[\p{Extended_Pictographic}\u200d\ufe0f]/gu, "").replace(/\s{2,}/g, " ").trim();
 }
 
-export function templateFollowUp(product: FollowUpProduct | null | undefined, topics: Topic[], language: FollowUpLanguage): string {
+export function templateFollowUp(
+  product: FollowUpProduct | null | undefined,
+  topics: Topic[],
+  language: FollowUpLanguage,
+  stage: "interest" | "checkout" = "interest"
+): string {
   const name = product ? displayName(product) : "";
   const price = product ? priceLine(product) : "";
+
+  // 1. Checkout Stage Reminder (address & phone number request to complete order)
+  if (stage === "checkout") {
+    if (language === "si") {
+      if (name) {
+        return `Hi! ඔයා ඇණවුම් කිරීමට තෝරාගත් ${name} එක එවන්න delivery address එකයි phone numbers 2කුයි එවන්න පුළුවන්ද? 😊 ඉක්මනින්ම pack කරලා delivery කරන්නම්!`;
+      }
+      return `Hi! ඔයා ඇණවුම් කිරීමට තෝරාගත් items එවන්න delivery address එකයි phone numbers 2කුයි එවන්න පුළුවන්ද? 😊 ඉක්මනින්ම delivery කරන්නම්!`;
+    }
+    if (language === "singlish") {
+      if (name) {
+        return `Hi! Oya order karanna thoragaththa ${name} eka deliver karanna address ekai phone numbers 2i ewanna puluwanda? 😊 Ikmanatama pack karala ewannam!`;
+      }
+      return `Hi! Oya order karanna thoragaththa items deliver karanna address ekai phone numbers 2i ewanna puluwanda? 😊 Ikmanatama ewannam!`;
+    }
+    if (language === "ta") {
+      if (name) {
+        return `Hi! நீங்கள் தெரிவுசெய்த ${name} ஐ அனுப்ப உங்கள் delivery address மற்றும் phone number ஐ அனுப்ப முடியுமா? 😊 விரைவில் அனுப்பிவைப்போம்!`;
+      }
+      return `Hi! உங்கள் ஆர்டரை அனுப்ப delivery address மற்றும் phone number ஐ அனுப்ப முடியுமா? 😊 விரைவில் அனுப்பிவைப்போம்!`;
+    }
+    if (name) {
+      return `Hi! Could you please share your delivery address and phone number so we can dispatch your ${name}? 😊`;
+    }
+    return `Hi! Could you please share your delivery address and phone number so we can dispatch your order? 😊`;
+  }
+
+  // 2. Interest Stage Reminder (inquiring / browsing stage)
   const topic = (["price", "size", "colour", "photos", "availability", "delivery", "details"] as Topic[]).find((t) => topics.includes(t));
 
   if (language === "si") {
@@ -485,11 +576,50 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
         }
 
         // Match product discussed
+        // 1. Scan customer messages in reverse chronological order
         let matchedProduct: FollowUpProduct | null = null;
         for (const text of customerTexts) {
           matchedProduct = mentionsProduct(text, products);
           if (matchedProduct) break;
         }
+
+        // 2. If customer didn't name product explicitly, scan bot messages in reverse!
+        // The bot introduces products ("මේක අපේ Rib Short එක", "Rib Short 5 pcs pack එක...", "[ATTACH_PRODUCT: ...]")
+        if (!matchedProduct && products.length > 0) {
+          for (const m of msgs) {
+            if (m.role === "model") {
+              const content = String(m.content ?? "").trim();
+              const attachMatch = content.match(/\[ATTACH_PRODUCT:\s*([^\]]+)\]/i);
+              if (attachMatch) {
+                const target = attachMatch[1].trim();
+                const found = products.find((p) => p.name.trim().toLowerCase() === target.toLowerCase()) || mentionsProduct(target, products);
+                if (found) {
+                  matchedProduct = found;
+                  break;
+                }
+              }
+              const botMatched = mentionsProduct(content, products);
+              if (botMatched) {
+                const allMatches = products.filter((p) => mentionsProduct(content, [p]));
+                if (allMatches.length <= 2) {
+                  matchedProduct = botMatched;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        // Detect checkout stage (address/phone requested and customer agreed or sent options)
+        const recentBotMsgs = msgs.filter((m) => m.role === "model").slice(0, 4);
+        const askedForAddress = recentBotMsgs.some((m) =>
+          /\b(?:address|phone\s*numbers?|delivery\s*address|city|order\s*details|confirm)\b|ලිපිනය|දුරකථන|ඇණවුම\s*තහවුරු|නම,\s*සම්පූර්ණ/i.test(String(m.content ?? ""))
+        );
+        const recentCustMsgs = customerTexts.slice(0, 4);
+        const customerAgreedToBuy = recentCustMsgs.some((m) =>
+          /\b(?:ok|hari|address|danna|ewannam|order|oni|ona)\b|හරි|ඕන|ඕනේ|එවන්නම්|\d(?:\s+\d)+/i.test(m)
+        );
+        const isCheckoutStage = c.reminder_kind === "checkout" || (askedForAddress && customerAgreedToBuy);
 
         // Detect topic and language
         const combinedTexts = customerTexts.join(" ");
@@ -501,13 +631,13 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
 
         // Formulate follow-up message text
         let messageText = "";
-        let prefix = "[interest reminder]";
+        let prefix = isCheckoutStage ? "[checkout reminder]" : "[interest reminder]";
 
         if (biz.followup_custom_enabled && biz.followup_custom_template) {
           messageText = fillCustomTemplate(biz.followup_custom_template, matchedProduct);
           prefix = "[custom reminder]";
         } else {
-          messageText = templateFollowUp(matchedProduct, topics, language);
+          messageText = templateFollowUp(matchedProduct, topics, language, isCheckoutStage ? "checkout" : "interest");
         }
 
         if (!messageText.trim()) {

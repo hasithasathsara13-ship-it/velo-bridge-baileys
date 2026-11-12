@@ -46,6 +46,193 @@ const TOPIC_PATTERNS: Array<[Topic, RegExp]> = [
 const STALE_WINDOW_MS = 72 * 3_600_000; // > 72h -> WhatsApp spam risk
 const FOLLOWUP_COOLDOWN_MS = 3 * 24 * 3_600_000; // 3 days
 const BUYING_TOPICS = new Set<Topic>(["price", "size", "colour", "delivery", "availability"]);
+const ORDER_CREATED_MARKER = /^\[ORDER_CREATED\]/i;
+const SYS_ORDERED = "sys-ordered";
+const SYS_PRODUCT_ASKED = "sys-product-asked";
+
+/** Build common WhatsApp / Sri Lankan stored phone variants for order matching. */
+export function buildPhoneVariants(phone: string): string[] {
+  const raw = String(phone || "").trim();
+  const out = new Set<string>();
+  if (raw) out.add(raw);
+  const withoutJid = raw.replace(/@.*/g, "").trim();
+  if (withoutJid) out.add(withoutJid);
+  const digits = withoutJid.replace(/\D/g, "");
+  if (digits) {
+    out.add(digits);
+    out.add(`+${digits}`);
+    if (digits.startsWith("94") && digits.length === 11) {
+      out.add(`0${digits.slice(2)}`);
+    } else if (digits.startsWith("0") && digits.length === 10) {
+      const intl = `94${digits.slice(1)}`;
+      out.add(intl);
+      out.add(`+${intl}`);
+    }
+  }
+  return Array.from(out).filter(Boolean);
+}
+
+/** Ensure Ordered supersedes Product Asked inside comma-separated chat_label_ids. */
+export function applyOrderedLabelString(rawLabels: string | null | undefined): string {
+  const current = String(rawLabels || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const next = current.filter((id) => id !== SYS_PRODUCT_ASKED && id !== SYS_ORDERED);
+  next.push(SYS_ORDERED);
+  return next.join(",");
+}
+
+export type CronMessageRow = { role: string; content: string | null; created_at: string };
+export type CronOrderRow = { id?: string; status?: string | null; created_at?: string | null };
+
+export type CandidateEvalResult =
+  | { eligible: false; reason: "no_chat" | "stale" | "quiet" | "recent_followup" | "ordered" | "no_interest"; clearReminder: boolean; ensureOrderedLabel?: boolean }
+  | {
+      eligible: true;
+      matchedProduct: FollowUpProduct | null;
+      topics: Topic[];
+      language: FollowUpLanguage;
+      isCheckoutStage: boolean;
+      score: number;
+      lastCustomerAt: number;
+    };
+
+/**
+ * Pure follow-up eligibility evaluator shared by cron execution and tests.
+ * Strictly blocks any customer with an active/recent order or no new post-order product inquiry.
+ */
+export function evaluateFollowUpCandidate(args: {
+  msgsNewestFirst: CronMessageRow[];
+  ordersNewestFirst: CronOrderRow[];
+  products: FollowUpProduct[];
+  quietWindowMs: number;
+  reminderKind?: string | null;
+  chatLabelIds?: string | null;
+  now?: number;
+}): CandidateEvalResult {
+  const { msgsNewestFirst, ordersNewestFirst, products, quietWindowMs, reminderKind, chatLabelIds } = args;
+  const now = args.now ?? Date.now();
+  if (!msgsNewestFirst.length) {
+    return { eligible: false, reason: "no_chat", clearReminder: true };
+  }
+
+  let lastCustomerAt: number | null = null;
+  let lastFollowUpAt: number | null = null;
+  let lastOrderMarkerAt: number | null = null;
+
+  for (const m of msgsNewestFirst) {
+    const at = Date.parse(m.created_at);
+    if (!Number.isFinite(at)) continue;
+    const isCustomer = m.role === "user";
+    const content = String(m.content ?? "").trim();
+
+    if (!isCustomer && /^\[(?:interest|checkout|custom) reminder\]/i.test(content)) {
+      if (lastFollowUpAt === null || at > lastFollowUpAt) lastFollowUpAt = at;
+    }
+    if (!isCustomer && ORDER_CREATED_MARKER.test(content)) {
+      if (lastOrderMarkerAt === null || at > lastOrderMarkerAt) lastOrderMarkerAt = at;
+    }
+    if (isCustomer && (lastCustomerAt === null || at > lastCustomerAt)) {
+      lastCustomerAt = at;
+    }
+  }
+
+  if (lastCustomerAt === null) {
+    return { eligible: false, reason: "no_chat", clearReminder: true };
+  }
+  if (now - lastCustomerAt > STALE_WINDOW_MS) {
+    return { eligible: false, reason: "stale", clearReminder: true };
+  }
+  if (now - lastCustomerAt < quietWindowMs) {
+    return { eligible: false, reason: "quiet", clearReminder: false };
+  }
+  if (lastFollowUpAt !== null && lastCustomerAt <= lastFollowUpAt) {
+    return { eligible: false, reason: "recent_followup", clearReminder: true };
+  }
+
+  // Filter to non-cancelled orders (Pending, Confirmed, Packed, Dispatched, Delivered, Completed, etc.)
+  const nonCancelledOrders = ordersNewestFirst.filter(
+    (o) => String(o.status ?? "").trim().toLowerCase() !== "cancelled"
+  );
+  const latestOrder = nonCancelledOrders[0];
+  const latestOrderAt = latestOrder?.created_at && Number.isFinite(Date.parse(latestOrder.created_at))
+    ? Date.parse(latestOrder.created_at)
+    : null;
+
+  // Never send a follow-up if the customer placed a non-cancelled order within the 3-day cooldown window
+  if (latestOrder && (latestOrderAt === null || latestOrderAt >= now - FOLLOWUP_COOLDOWN_MS)) {
+    return { eligible: false, reason: "ordered", clearReminder: true, ensureOrderedLabel: true };
+  }
+
+  const effectiveOrderAt = Math.max(lastOrderMarkerAt ?? 0, latestOrderAt ?? 0);
+  if (effectiveOrderAt > 0 && lastCustomerAt <= effectiveOrderAt) {
+    return { eligible: false, reason: "ordered", clearReminder: true, ensureOrderedLabel: true };
+  }
+
+  // Only inspect conversation messages occurring strictly AFTER any completed/confirmed order
+  const activeMsgs = effectiveOrderAt > 0
+    ? msgsNewestFirst.filter((m) => {
+        const at = Date.parse(m.created_at);
+        return Number.isFinite(at) && at > effectiveOrderAt;
+      })
+    : msgsNewestFirst;
+
+  const activeCustomerTexts: string[] = [];
+  for (const m of activeMsgs) {
+    if (m.role !== "user") continue;
+    const content = String(m.content ?? "").trim();
+    if (content && !/^\[[A-Z_]+\]/.test(content)) activeCustomerTexts.push(content);
+  }
+
+  // If the customer already has an ordered label and no clear post-order product inquiry exists, skip safely
+  const hasOrderedLabel = String(chatLabelIds || "")
+    .split(",")
+    .map((s) => s.trim())
+    .includes(SYS_ORDERED);
+
+  // If the customer already has a non-cancelled order in history, a generic "?" or "delivery?" post-order check-in
+  // must NEVER re-trigger a product follow-up; require an explicit catalog product inquiry after the order.
+  const showedInterest = effectiveOrderAt > 0
+    ? (products.length > 0 && activeCustomerTexts.some((t) => Boolean(mentionsProduct(t, products))) && customerShowedProductInterest(activeCustomerTexts, products))
+    : customerShowedProductInterest(activeCustomerTexts, products);
+  if (!showedInterest) {
+    const orderedReason = effectiveOrderAt > 0 || hasOrderedLabel;
+    return {
+      eligible: false,
+      reason: orderedReason ? "ordered" : "no_interest",
+      clearReminder: true,
+      ensureOrderedLabel: Boolean(effectiveOrderAt > 0),
+    };
+  }
+
+  const matchedProduct: FollowUpProduct | null = products.length > 0 ? (findDiscussedProduct(activeMsgs, products) ?? null) : null;
+
+  const recentBotMsgs = activeMsgs.filter((m) => m.role === "model").slice(0, 4);
+  const askedForAddress = recentBotMsgs.some((m) =>
+    /\b(?:address|phone\s*numbers?|delivery\s*address|city|order\s*details|confirm)\b|ලිපිනය|දුරකථන|ඇණවුම\s*තහවුරු|නම,\s*සම්පූර්ණ/i.test(String(m.content ?? ""))
+  );
+  const recentCustMsgs = activeCustomerTexts.slice(0, 4);
+  const customerAgreedToBuy = recentCustMsgs.some((m) =>
+    /\b(?:ok|hari|address|danna|ewannam|order|oni|ona)\b|හරි|ඕන|ඕනේ|එවන්නම්|\d(?:\s+\d)+/i.test(m)
+  );
+  const isCheckoutStage = reminderKind === "checkout" || (askedForAddress && customerAgreedToBuy);
+
+  const combinedTexts = activeCustomerTexts.join(" ");
+  const topics = TOPIC_PATTERNS.filter(([, re]) => re.test(combinedTexts)).map(([t]) => t);
+  const language = detectLanguage(activeCustomerTexts);
+  const score = calculateLeadScore(topics, matchedProduct, activeCustomerTexts, lastCustomerAt, now);
+
+  return {
+    eligible: true,
+    matchedProduct,
+    topics,
+    language,
+    isCheckoutStage,
+    score,
+    lastCustomerAt,
+  };
+}
 
 export function extractProductAliases(p: FollowUpProduct): string[] {
   const aliases: string[] = [p.name.trim().toLowerCase()];
@@ -349,7 +536,7 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
     // 5. Fetch Candidates Due for this shop (fetch up to 60 to evaluate and pick the best)
     const { data: candidates, error: cErr } = await sb
       .from("customers")
-      .select("id, phone_number, checkout_reminder_at, reminder_kind")
+      .select("id, phone_number, checkout_reminder_at, reminder_kind, chat_label_ids")
       .eq("shop_id", shopId)
       .eq("bot_active", true)
       .or("checkout_reminder_sent.eq.false,checkout_reminder_sent.is.null")
@@ -368,111 +555,55 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
     for (const c of candidates) {
       try {
         const phone = c.phone_number;
+        const phoneVariants = buildPhoneVariants(phone);
 
-        // Fetch recent chat messages for this customer
-        const { data: rawMsgs } = await sb
-          .from("messages")
-          .select("role, content, created_at")
-          .eq("shop_id", shopId)
-          .eq("phone_number", phone)
-          .order("created_at", { ascending: false })
-          .limit(30);
+        // Fetch recent chat messages and recent orders across all phone format variants in parallel
+        const [{ data: rawMsgs }, { data: recentOrdersRaw }] = await Promise.all([
+          sb
+            .from("messages")
+            .select("role, content, created_at")
+            .eq("shop_id", shopId)
+            .in("phone_number", phoneVariants)
+            .order("created_at", { ascending: false })
+            .limit(40),
+          sb
+            .from("orders")
+            .select("id, status, created_at")
+            .eq("shop_id", shopId)
+            .in("customer_phone", phoneVariants)
+            .order("created_at", { ascending: false })
+            .limit(10),
+        ]);
 
-        const msgs = rawMsgs || [];
-        if (!msgs.length) {
-          await sb.from("customers").update({ checkout_reminder_sent: true }).eq("id", c.id);
-          totalSkipped++;
-          continue;
-        }
+        const evaluation = evaluateFollowUpCandidate({
+          msgsNewestFirst: (rawMsgs ?? []) as CronMessageRow[],
+          ordersNewestFirst: (recentOrdersRaw ?? []) as CronOrderRow[],
+          products,
+          quietWindowMs,
+          reminderKind: c.reminder_kind,
+          chatLabelIds: (c as { chat_label_ids?: string | null }).chat_label_ids ?? null,
+          now,
+        });
 
-        // Parse timestamps
-        let lastCustomerAt: number | null = null;
-        let lastBotAt: number | null = null;
-        let lastFollowUpAt: number | null = null;
-        const customerTexts: string[] = [];
-
-        for (const m of msgs) {
-          const at = Date.parse(m.created_at);
-          const isCustomer = m.role === "user";
-          const content = String(m.content ?? "").trim();
-
-          if (!isCustomer && /^\[(?:interest|checkout|custom) reminder\]/i.test(content)) {
-            if (lastFollowUpAt === null || at > lastFollowUpAt) lastFollowUpAt = at;
+        if (!evaluation.eligible) {
+          if (evaluation.clearReminder) {
+            const patch: Record<string, unknown> = {
+              checkout_reminder_sent: true,
+              checkout_reminder_at: null,
+              reminder_kind: null,
+            };
+            if (evaluation.ensureOrderedLabel) {
+              patch.chat_label_ids = applyOrderedLabelString(
+                (c as { chat_label_ids?: string | null }).chat_label_ids
+              );
+            }
+            await sb.from("customers").update(patch).eq("id", c.id);
+            totalSkipped++;
           }
-          if (isCustomer) {
-            if (lastCustomerAt === null || at > lastCustomerAt) lastCustomerAt = at;
-            if (!/^\[[A-Z_]+\]/.test(content)) customerTexts.push(content);
-          } else {
-            if (lastBotAt === null || at > lastBotAt) lastBotAt = at;
-          }
-        }
-
-        // Check Stale (>72h): outside safe WhatsApp window
-        if (lastCustomerAt && now - lastCustomerAt > STALE_WINDOW_MS) {
-          await sb.from("customers").update({ checkout_reminder_sent: true }).eq("id", c.id);
-          totalSkipped++;
           continue;
         }
 
-        // Check Quiet Window (< waitHours e.g. 4h, 6h, 12h): customer still in silence window
-        if (lastCustomerAt && now - lastCustomerAt < quietWindowMs) {
-          // Leave eligible for subsequent run
-          continue;
-        }
-
-        // Check recent follow-up cooldown
-        if (lastFollowUpAt && lastCustomerAt && lastCustomerAt <= lastFollowUpAt) {
-          await sb.from("customers").update({ checkout_reminder_sent: true }).eq("id", c.id);
-          totalSkipped++;
-          continue;
-        }
-
-        // Check if customer already placed an order in last 3 days
-        const sinceOrder = new Date(now - FOLLOWUP_COOLDOWN_MS).toISOString();
-        const { data: recentOrder } = await sb
-          .from("orders")
-          .select("id")
-          .eq("shop_id", shopId)
-          .eq("customer_phone", phone)
-          .gte("created_at", sinceOrder)
-          .limit(1)
-          .maybeSingle();
-
-        if (recentOrder) {
-          await sb.from("customers").update({ checkout_reminder_sent: true }).eq("id", c.id);
-          totalSkipped++;
-          continue;
-        }
-
-        // Check Product Interest
-        const showedInterest = customerShowedProductInterest(customerTexts, products);
-        if (!showedInterest) {
-          await sb.from("customers").update({ checkout_reminder_sent: true }).eq("id", c.id);
-          totalSkipped++;
-          continue;
-        }
-
-        // Match product discussed: use generic catalog-driven matching across recent messages
-        const matchedProduct: FollowUpProduct | null = products.length > 0 ? (findDiscussedProduct(msgs, products) ?? null) : null;
-
-        // Detect checkout stage (address/phone requested and customer agreed or sent options)
-        const recentBotMsgs = msgs.filter((m) => m.role === "model").slice(0, 4);
-        const askedForAddress = recentBotMsgs.some((m) =>
-          /\b(?:address|phone\s*numbers?|delivery\s*address|city|order\s*details|confirm)\b|ලිපිනය|දුරකථන|ඇණවුම\s*තහවුරු|නම,\s*සම්පූර්ණ/i.test(String(m.content ?? ""))
-        );
-        const recentCustMsgs = customerTexts.slice(0, 4);
-        const customerAgreedToBuy = recentCustMsgs.some((m) =>
-          /\b(?:ok|hari|address|danna|ewannam|order|oni|ona)\b|හරි|ඕන|ඕනේ|එවන්නම්|\d(?:\s+\d)+/i.test(m)
-        );
-        const isCheckoutStage = c.reminder_kind === "checkout" || (askedForAddress && customerAgreedToBuy);
-
-        // Detect topic and language
-        const combinedTexts = customerTexts.join(" ");
-        const topics = TOPIC_PATTERNS.filter(([, re]) => re.test(combinedTexts)).map(([t]) => t);
-        const language = detectLanguage(customerTexts);
-
-        // Calculate lead quality score
-        const score = calculateLeadScore(topics, matchedProduct, customerTexts, lastCustomerAt, now);
+        const { matchedProduct, topics, language, isCheckoutStage, score, lastCustomerAt } = evaluation;
 
         // Formulate follow-up message text
         let messageText = "";
@@ -493,7 +624,7 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
           candidateId: c.id,
           phone,
           score,
-          lastCustomerAt: lastCustomerAt ?? 0,
+          lastCustomerAt,
           messageText,
           prefix,
         });

@@ -38,6 +38,7 @@ interface QuotedContextResult {
   replyToId: string | null;
   replySnippet: string | null;
   productName?: string;
+  variantLabel?: string;
   imageIndex?: number;
   totalImages?: number;
   imageUrl?: string;
@@ -1207,6 +1208,8 @@ export class Session {
       let replyToId: string | null = quotedRow?.id || null;
       let replySnippet: string | null = null;
       let productName: string | undefined;
+      let variantLabel: string | undefined;
+      let variantPrice: number | undefined;
       let imageIndex: number | undefined;
       let totalImages: number | undefined;
       let imageUrl: string | undefined;
@@ -1237,12 +1240,34 @@ export class Session {
         try {
           const { data: prods } = await sb
             .from("products")
-            .select("id, name, images")
+            .select("id, name, images, price_variants")
             .eq("shop_id", shopId)
             .eq("is_active", true);
 
           if (prods && prods.length > 0) {
             for (const prod of prods) {
+              // 1. Check per-variant photos first
+              const variants = Array.isArray((prod as any).price_variants) ? (prod as any).price_variants : [];
+              const variantsWithPhoto = variants.filter(
+                (v: any) => v && typeof v.image_url === "string" && /^https?:\/\//i.test(v.image_url.trim()),
+              );
+              const matchedVarIdx = variantsWithPhoto.findIndex((v: any) => {
+                const vUrl = v.image_url.trim();
+                return vUrl === imageUrl || vUrl.includes(imageUrl!) || imageUrl!.includes(vUrl);
+              });
+              if (matchedVarIdx >= 0) {
+                const matchedVar = variantsWithPhoto[matchedVarIdx];
+                productName = prod.name;
+                variantLabel = typeof matchedVar.label === "string" ? matchedVar.label.trim() : undefined;
+                if (typeof matchedVar.price === "number" && Number.isFinite(matchedVar.price)) {
+                  variantPrice = matchedVar.price;
+                }
+                imageIndex = matchedVarIdx + 1;
+                totalImages = variantsWithPhoto.length;
+                break;
+              }
+
+              // 2. Fallback to main product images[]
               const rawImages = Array.isArray(prod.images)
                 ? prod.images
                 : (typeof prod.images === "string"
@@ -1263,7 +1288,10 @@ export class Session {
           console.warn(`[quoted] product lookup failed for shop ${shopId}:`, prodErr);
         }
 
-        if (productName) {
+        if (productName && variantLabel) {
+          const priceNote = variantPrice !== undefined ? ` — Rs.${variantPrice}` : "";
+          replySnippet = `📷 Variant photo: ${productName} (${variantLabel}${priceNote})`;
+        } else if (productName) {
           const normName = productName.toLowerCase().trim();
           const colorList = PRODUCT_IMAGE_COLORS[normName];
           color = (imageIndex && colorList && colorList[imageIndex - 1]) ? colorList[imageIndex - 1] : undefined;
@@ -1288,11 +1316,12 @@ export class Session {
         }
       }
 
-      console.log(`[quoted] resolved quoted msg for waId=${waId}: snippet="${replySnippet}", prod="${productName || "-"}", idx=${imageIndex || "-"}`);
+      console.log(`[quoted] resolved quoted msg for waId=${waId}: snippet="${replySnippet}", prod="${productName || "-"}", variant="${variantLabel || "-"}", idx=${imageIndex || "-"}`);
       return {
         replyToId,
         replySnippet,
         productName,
+        variantLabel,
         imageIndex,
         totalImages,
         imageUrl,

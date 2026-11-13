@@ -1889,7 +1889,7 @@ export class Session {
       try {
         res = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "x-bridge-secret": secret, "x-bridge-supports": "showcase" },
+          headers: { "Content-Type": "application/json", "x-bridge-secret": secret, "x-bridge-supports": "showcase,media-ack" },
           body: JSON.stringify(payload),
           signal: AbortSignal.timeout(BOT_FETCH_TIMEOUT_MS),
         });
@@ -1953,11 +1953,19 @@ export class Session {
         // instead of a photo album followed by a wall of captions.
         captioned_images?: Array<{ url?: string; caption?: string }>;
         greeting_bubbles?: string[];
+        media_dispatches?: Array<{
+          dispatchId?: string;
+          productId?: string;
+          productName?: string;
+          deliveryMode?: "full_gallery" | "showcase_preview" | "explicit_resend";
+          expectedUrls?: string[];
+        }>;
       };
 
       if (!res.ok || !data?.ok) return;
 
       const captionedImages = (data.captioned_images || []).filter((c) => c && typeof c.url === "string" && c.url.trim());
+      const rawDispatches = Array.isArray(data.media_dispatches) ? data.media_dispatches : [];
 
       // Nothing to send (paused bot, duplicate, quota…) — don't mark as read.
       const hasOutput =
@@ -1971,10 +1979,6 @@ export class Session {
       // Small random delay before starting to send (simulates bot "thinking")
       await randomDelay(800, 1500);
 
-      // Every piece below goes through sendReplyPiece(): a cap/pacing refusal is
-      // waited out and retried, and a piece that truly cannot be sent is logged
-      // loudly instead of vanishing (the dashboard already shows the reply).
-
       // Extract greeting bubbles, images, and reply bubbles.
       // Order required on first contact:
       // 1. Greeting -> 2. Showcase cards (or product photos) -> 3. AI reply / answer
@@ -1983,8 +1987,61 @@ export class Session {
       const replyBubbles = (data.bubbles || []).filter((b) => b && typeof b === "string" && b.trim() && !greetingSet.has(b.trim()));
       const images = (data.images || []).filter((url) => url && typeof url === "string" && url.trim());
 
-      // Greeting / lead text goes out FIRST, then captioned showcase product cards,
-      // and finally any AI reply answering a first-contact question (e.g. courier charge or pack price).
+      const sentOutcomeByUrl = new Map<string, { ok: boolean; waId?: string; error?: string }>();
+      const recordSendOutcome = (
+        url: string,
+        outcome: { ok: boolean; value?: { id?: string }; error?: string },
+      ) => {
+        sentOutcomeByUrl.set(url.trim(), {
+          ok: outcome.ok,
+          waId: outcome.value?.id || undefined,
+          error: outcome.error,
+        });
+      };
+
+      const flushMediaAck = async () => {
+        if (rawDispatches.length === 0) return;
+        const outcomes = rawDispatches
+          .filter((d) => d && d.dispatchId && d.productId && Array.isArray(d.expectedUrls))
+          .map((d) => {
+            const expectedUrls = (d.expectedUrls || []).map((u) => String(u).trim()).filter(Boolean);
+            const sentUrls: string[] = [];
+            const failedUrls: string[] = [];
+            const waMessageIds: string[] = [];
+            const waIdByUrl: Record<string, string> = {};
+            let lastError: string | null = null;
+            for (const u of expectedUrls) {
+              const out = sentOutcomeByUrl.get(u);
+              if (out?.ok) {
+                sentUrls.push(u);
+                if (out.waId) {
+                  waMessageIds.push(out.waId);
+                  waIdByUrl[u] = out.waId;
+                }
+              } else {
+                failedUrls.push(u);
+                if (out?.error) lastError = out.error;
+              }
+            }
+            return {
+              dispatch_id: d.dispatchId!,
+              product_id: d.productId!,
+              delivery_mode: d.deliveryMode || "full_gallery",
+              expected_urls: expectedUrls,
+              sent_urls: sentUrls,
+              failed_urls: failedUrls,
+              wa_message_ids: waMessageIds,
+              wa_id_by_url: waIdByUrl,
+              error: lastError,
+            };
+          });
+        if (outcomes.length > 0) {
+          await this.reportMediaOutcomes(frontendUrl, bridgeSecret, shopId, phone, outcomes);
+        }
+      };
+
+      // Greeting / lead text goes out FIRST, then captioned showcase/variant product cards,
+      // and finally any AI reply answering the customer's question.
       if (captionedImages.length > 0) {
         if (greetingBubbles.length > 0) {
           for (const b of greetingBubbles.slice(0, MAX_BOT_BUBBLES)) {
@@ -1996,10 +2053,16 @@ export class Session {
         }
         // Then each product as a single photo+caption message, 1-2s apart.
         for (const card of captionedImages.slice(0, 30)) {
-          if (await this.sendReplyPiece(phone, "product card", () => this.sendImage(phone, card.url as string, (card.caption || "").trim() || undefined))) {
+          const url = String(card.url).trim();
+          const outcome = await this.sendReplyPieceDetailed(phone, "product card", () =>
+            this.sendImage(phone, url, (card.caption || "").trim() || undefined),
+          );
+          recordSendOutcome(url, outcome);
+          if (outcome.ok) {
             await randomDelay(1200, 2200);
           }
         }
+        await flushMediaAck();
 
         // Send audio voices for showcase products
         for (const url of (data.audios || []).slice(0, 5)) {
@@ -2036,10 +2099,15 @@ export class Session {
 
       // 2. Send images (product photos) second
       for (const url of images.slice(0, 30)) {
-        if (await this.sendReplyPiece(phone, "image", () => this.sendImage(phone, url))) {
+        const outcome = await this.sendReplyPieceDetailed(phone, "image", () =>
+          this.sendImage(phone, url),
+        );
+        recordSendOutcome(url, outcome);
+        if (outcome.ok) {
           await randomDelay(1000, 2000);
         }
       }
+      await flushMediaAck();
 
       // 3. Send answer / product description bubbles third
       for (const b of replyBubbles.slice(0, MAX_BOT_BUBBLES)) {
@@ -2081,36 +2149,90 @@ export class Session {
    * to find in `pm2 logs` (the dashboard has already shown the reply by then).
    */
   private async sendReplyPiece(phone: string, label: string, send: () => Promise<unknown>): Promise<boolean> {
+    const res = await this.sendReplyPieceDetailed(phone, label, send);
+    return res.ok;
+  }
+
+  private async sendReplyPieceDetailed<T>(
+    phone: string,
+    label: string,
+    send: () => Promise<T>,
+  ): Promise<{ ok: boolean; value?: T; error?: string }> {
     const MAX_TRIES = 4;
     const MAX_WAIT_MS = 70_000;
+    let lastError = "";
     for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
       try {
-        await send();
+        const value = await send();
         if (attempt > 1) console.log(`[bot] ${label} for ${phone} sent on attempt ${attempt}`);
-        return true;
+        return { ok: true, value };
       } catch (e) {
         if (e instanceof SendBlockedError) {
+          lastError = `${e.code}: ${e.message}`;
           const retryable = !e.permanent && (e.code === "rate_limit" || e.code === "recipient_limit" || e.code === "busy");
           const waitMs = Math.max(e.retryAfterMs ?? 3000, 1000) + 500;
           if (!retryable || attempt === MAX_TRIES || waitMs > MAX_WAIT_MS) {
             console.error(`[bot] ${label} DROPPED for ${phone}: ${e.code} — ${e.message}${waitMs > MAX_WAIT_MS ? ` (would need ${Math.round(waitMs / 1000)}s)` : ""}`);
-            return false;
+            return { ok: false, error: lastError };
           }
           console.warn(`[bot] ${label} held for ${phone}: ${e.code}; retrying in ${Math.round(waitMs / 1000)}s (attempt ${attempt}/${MAX_TRIES})`);
           await sleep(waitMs);
           continue;
         }
         const msg = e instanceof Error ? e.message : String(e);
+        lastError = msg;
         if (attempt === 1 && /connection (closed|lost|terminated)|not connected|session not connected/i.test(msg)) {
           console.warn(`[bot] ${label} for ${phone} hit "${msg}" — nothing was sent, retrying once in 3s`);
           await sleep(3000);
           continue;
         }
         console.error(`[bot] ${label} FAILED for ${phone} (not retried to avoid a duplicate):`, e);
-        return false;
+        return { ok: false, error: lastError };
       }
     }
-    return false;
+    return { ok: false, error: lastError || "max retries reached" };
+  }
+
+  private async reportMediaOutcomes(
+    frontendUrl: string,
+    bridgeSecret: string,
+    shopId: string,
+    phone: string,
+    dispatches: Array<{
+      dispatch_id: string;
+      product_id: string;
+      delivery_mode: string;
+      expected_urls: string[];
+      sent_urls: string[];
+      failed_urls: string[];
+      wa_message_ids: string[];
+      wa_id_by_url: Record<string, string>;
+      error: string | null;
+    }>,
+  ): Promise<void> {
+    if (!frontendUrl || !bridgeSecret || dispatches.length === 0) return;
+    const statusUrl = `${frontendUrl.replace(/\/$/, "")}/api/wa-web-bot/media-status`;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const res = await fetch(statusUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-bridge-secret": bridgeSecret,
+          },
+          body: JSON.stringify({ shop_id: shopId, phone_number: phone, dispatches }),
+          signal: AbortSignal.timeout(8_000),
+        });
+        if (res.ok || (res.status >= 400 && res.status < 500 && res.status !== 429)) {
+          return;
+        }
+      } catch (err) {
+        if (attempt === 2) {
+          console.warn(`[bot] media-status callback failed after retries for ${phone}:`, err);
+        }
+      }
+      await sleep(350 * (attempt + 1));
+    }
   }
 
   // ─── Send Methods ────────────────────────────────────────────────────────
@@ -2319,58 +2441,61 @@ export class Session {
     if (!this.sock) throw new Error("Session not connected");
     const jid = this.toJid(phone);
     await this.reserveSend(phone, opts);
-    
+
     // Show typing indicator before sending image
     if (showTyping) {
       await this.showTyping(phone, 1500); // 1.5 seconds typing for images
     }
-    
-    try {
-      let buffer: Buffer;
-      if (imageUrl.startsWith("data:image/")) {
-        const commaIdx = imageUrl.indexOf(",");
-        const base64Part = commaIdx >= 0 ? imageUrl.slice(commaIdx + 1) : imageUrl;
-        buffer = Buffer.from(base64Part, "base64");
-      } else {
-        // Fetch the bytes ourselves — more reliable than letting Baileys fetch a
-        // remote URL, which can fail silently on redirects/slow responses.
-        const res = await fetch(imageUrl, { signal: AbortSignal.timeout(MEDIA_FETCH_TIMEOUT_MS) });
-        if (!res.ok) throw new Error(`Failed to fetch image_url: ${res.status}`);
-        buffer = Buffer.from(await res.arrayBuffer());
-      }
-      const sent = await this.trackBridgeSend(jid, () =>
-        this.sock!.sendMessage(jid, { image: buffer, caption: caption || undefined }),
-      );
-      const id = sent?.key?.id || "";
-      if (id && imageUrl) {
-        this.sentImageUrls.set(id, imageUrl);
-        if (this.sentImageUrls.size > 1000) {
-          const oldest = this.sentImageUrls.keys().next().value;
-          if (oldest !== undefined) this.sentImageUrls.delete(oldest);
+
+    // Separate buffer download (safe to retry) from sock.sendMessage (never duplicated on timeout)
+    let buffer: Buffer | null = null;
+    if (imageUrl.startsWith("data:image/")) {
+      const commaIdx = imageUrl.indexOf(",");
+      const base64Part = commaIdx >= 0 ? imageUrl.slice(commaIdx + 1) : imageUrl;
+      buffer = Buffer.from(base64Part, "base64");
+    } else {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          const res = await fetch(imageUrl, { signal: AbortSignal.timeout(MEDIA_FETCH_TIMEOUT_MS) });
+          if (res.ok) {
+            buffer = Buffer.from(await res.arrayBuffer());
+            break;
+          }
+          if (res.status !== 429 && res.status < 500) {
+            throw new Error(`Failed to fetch image_url: ${res.status}`);
+          }
+        } catch (err) {
+          if (attempt === 1) {
+            console.warn(`[session ${this.info.shopId}] sendImage buffer fetch failed, using URL fallback:`, err);
+          } else {
+            await sleep(350);
+          }
         }
       }
-      if (!imageUrl.startsWith("data:")) {
-        void this.attachOutgoingWaId(phone, id, imageUrl);
-      }
-      return { id };
-    } catch (err) {
-      console.error(`[session ${this.info.shopId}] sendImage fetch failed, falling back to url mode:`, err);
-      const sent = await this.trackBridgeSend(jid, () =>
-        this.sock!.sendMessage(jid, { image: { url: imageUrl }, caption: caption || undefined }),
-      );
-      const id = sent?.key?.id || "";
-      if (id && imageUrl) {
-        this.sentImageUrls.set(id, imageUrl);
-        if (this.sentImageUrls.size > 1000) {
-          const oldest = this.sentImageUrls.keys().next().value;
-          if (oldest !== undefined) this.sentImageUrls.delete(oldest);
-        }
-      }
-      if (!imageUrl.startsWith("data:")) {
-        void this.attachOutgoingWaId(phone, id, imageUrl);
-      }
-      return { id };
     }
+
+    const mediaPayload = buffer
+      ? { image: buffer, caption: caption || undefined }
+      : { image: { url: imageUrl }, caption: caption || undefined };
+
+    const sent = await this.trackBridgeSend(jid, () =>
+      this.sock!.sendMessage(jid, mediaPayload),
+    );
+    const id = sent?.key?.id || "";
+    if (!id && !sent) {
+      throw new Error("WhatsApp sendMessage returned empty response");
+    }
+    if (id && imageUrl) {
+      this.sentImageUrls.set(id, imageUrl);
+      if (this.sentImageUrls.size > 1000) {
+        const oldest = this.sentImageUrls.keys().next().value;
+        if (oldest !== undefined) this.sentImageUrls.delete(oldest);
+      }
+    }
+    if (!imageUrl.startsWith("data:") && id) {
+      void this.attachOutgoingWaId(phone, id, imageUrl);
+    }
+    return { id };
   }
 
   async sendAudio(

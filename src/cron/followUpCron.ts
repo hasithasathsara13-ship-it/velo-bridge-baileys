@@ -15,12 +15,20 @@ import { getSupabase } from "../lib/supabase.js";
 import { getSession } from "../lib/sessionManager.js";
 import { AB } from "../lib/antiBan.js";
 import { matchProductInText, findDiscussedProduct } from "../lib/productMatch.js";
+import {
+  deriveCustomerProductInterestFromThread,
+  productKey,
+  type PersistedProductInterest,
+} from "../lib/productInterest.js";
 
 export type FollowUpProduct = {
+  id?: string | null;
+  shop_id?: string | null;
   name: string;
   price?: number | null;
   price_variants?: { label: string; price: number }[] | null;
   description?: string | null;
+  is_active?: boolean | null;
 };
 
 export type Topic = "price" | "photos" | "size" | "colour" | "delivery" | "availability" | "details";
@@ -83,11 +91,22 @@ export function applyOrderedLabelString(rawLabels: string | null | undefined): s
   return next.join(",");
 }
 
-export type CronMessageRow = { role: string; content: string | null; created_at: string };
+export type CronMessageRow = {
+  id?: string | null;
+  role: string;
+  content: string | null;
+  created_at: string;
+  metadata?: Record<string, unknown> | null;
+};
 export type CronOrderRow = { id?: string; status?: string | null; created_at?: string | null };
 
 export type CandidateEvalResult =
-  | { eligible: false; reason: "no_chat" | "stale" | "quiet" | "recent_followup" | "ordered" | "no_interest"; clearReminder: boolean; ensureOrderedLabel?: boolean }
+  | {
+      eligible: false;
+      reason: "no_chat" | "stale" | "quiet" | "recent_followup" | "ordered" | "no_interest" | "declined";
+      clearReminder: boolean;
+      ensureOrderedLabel?: boolean;
+    }
   | {
       eligible: true;
       matchedProduct: FollowUpProduct | null;
@@ -100,7 +119,9 @@ export type CandidateEvalResult =
 
 /**
  * Pure follow-up eligibility evaluator shared by cron execution and tests.
- * Strictly blocks any customer with an active/recent order or no new post-order product inquiry.
+ * Strictly blocks any customer with an active/recent order, declined offer,
+ * or no new post-order product inquiry, and resolves product strictly from
+ * verified CUSTOMER expressions.
  */
 export function evaluateFollowUpCandidate(args: {
   msgsNewestFirst: CronMessageRow[];
@@ -109,16 +130,33 @@ export function evaluateFollowUpCandidate(args: {
   quietWindowMs: number;
   reminderKind?: string | null;
   chatLabelIds?: string | null;
+  shopId?: string | null;
+  lastFollowupSentAt?: string | null;
+  persistedInterests?: PersistedProductInterest[];
   now?: number;
 }): CandidateEvalResult {
-  const { msgsNewestFirst, ordersNewestFirst, products, quietWindowMs, reminderKind, chatLabelIds } = args;
+  const {
+    msgsNewestFirst,
+    ordersNewestFirst,
+    products,
+    quietWindowMs,
+    reminderKind,
+    chatLabelIds,
+    shopId,
+    lastFollowupSentAt,
+    persistedInterests = [],
+  } = args;
   const now = args.now ?? Date.now();
+  const activeProducts = products.filter(
+    (p) => Boolean(p?.name) && p.is_active !== false && (!shopId || !p.shop_id || p.shop_id === shopId),
+  );
   if (!msgsNewestFirst.length) {
     return { eligible: false, reason: "no_chat", clearReminder: true };
   }
 
   let lastCustomerAt: number | null = null;
-  let lastFollowUpAt: number | null = null;
+  let lastFollowUpAt: number | null =
+    lastFollowupSentAt && Number.isFinite(Date.parse(lastFollowupSentAt)) ? Date.parse(lastFollowupSentAt) : null;
   let lastOrderMarkerAt: number | null = null;
 
   for (const m of msgsNewestFirst) {
@@ -126,8 +164,9 @@ export function evaluateFollowUpCandidate(args: {
     if (!Number.isFinite(at)) continue;
     const isCustomer = m.role === "user";
     const content = String(m.content ?? "").trim();
+    const isMetaReminder = Boolean(m.metadata && m.metadata.is_followup_reminder === true);
 
-    if (!isCustomer && /^\[(?:interest|checkout|custom) reminder\]/i.test(content)) {
+    if (!isCustomer && (isMetaReminder || /^\[(?:interest|checkout|custom) reminder\]/i.test(content))) {
       if (lastFollowUpAt === null || at > lastFollowUpAt) lastFollowUpAt = at;
     }
     if (!isCustomer && ORDER_CREATED_MARKER.test(content)) {
@@ -194,8 +233,8 @@ export function evaluateFollowUpCandidate(args: {
   // If the customer already has a non-cancelled order in history, a generic "?" or "delivery?" post-order check-in
   // must NEVER re-trigger a product follow-up; require an explicit catalog product inquiry after the order.
   const showedInterest = effectiveOrderAt > 0
-    ? (products.length > 0 && activeCustomerTexts.some((t) => Boolean(mentionsProduct(t, products))) && customerShowedProductInterest(activeCustomerTexts, products))
-    : customerShowedProductInterest(activeCustomerTexts, products);
+    ? (activeProducts.length > 0 && activeCustomerTexts.some((t) => Boolean(mentionsProduct(t, activeProducts))) && customerShowedProductInterest(activeCustomerTexts, activeProducts))
+    : customerShowedProductInterest(activeCustomerTexts, activeProducts);
   if (!showedInterest) {
     const orderedReason = effectiveOrderAt > 0 || hasOrderedLabel;
     return {
@@ -206,7 +245,50 @@ export function evaluateFollowUpCandidate(args: {
     };
   }
 
-  const matchedProduct: FollowUpProduct | null = products.length > 0 ? (findDiscussedProduct(activeMsgs, products) ?? null) : null;
+  const chronologicalMsgs = [...activeMsgs].reverse();
+  const derived = deriveCustomerProductInterestFromThread(chronologicalMsgs, activeProducts);
+
+  if (derived.status === "declined") {
+    return { eligible: false, reason: "declined", clearReminder: true };
+  }
+
+  let matchedProduct: FollowUpProduct | null = derived.activeProduct;
+
+  if (!matchedProduct && persistedInterests.length > 0) {
+    const latestActive = persistedInterests.find((row) => row.status === "active");
+    if (latestActive) {
+      const matchFromCatalog =
+        activeProducts.find((p) => p.id && p.id === latestActive.product_id) ??
+        activeProducts.find((p) => p.name.toLowerCase() === latestActive.product_name.toLowerCase());
+      if (
+        matchFromCatalog &&
+        !derived.declinedKeys.has(productKey(matchFromCatalog)) &&
+        !derived.purchasedKeys.has(productKey(matchFromCatalog))
+      ) {
+        matchedProduct = matchFromCatalog;
+      }
+    }
+  }
+
+  if (!matchedProduct && !derived.isAmbiguous && activeProducts.length > 0) {
+    const fallbackMatch = findDiscussedProduct(activeMsgs, activeProducts) ?? null;
+    if (
+      fallbackMatch &&
+      !derived.declinedKeys.has(productKey(fallbackMatch)) &&
+      !derived.purchasedKeys.has(productKey(fallbackMatch))
+    ) {
+      matchedProduct = fallbackMatch;
+    }
+  }
+
+  if (effectiveOrderAt > 0 && !matchedProduct) {
+    return {
+      eligible: false,
+      reason: "ordered",
+      clearReminder: true,
+      ensureOrderedLabel: true,
+    };
+  }
 
   const recentBotMsgs = activeMsgs.filter((m) => m.role === "model").slice(0, 4);
   const askedForAddress = recentBotMsgs.some((m) =>
@@ -390,11 +472,34 @@ export function templateFollowUp(
   return `Hi! Just following up on what you asked about earlier. Let us know if you need any details or would like to place an order! 😊`;
 }
 
+function formatVerifiedPrice(product?: FollowUpProduct | null): string {
+  if (!product) return "";
+  if (product.price != null && Number(product.price) > 0) {
+    return `Rs. ${Number(product.price).toLocaleString()}`;
+  }
+  const nums = (product.price_variants ?? [])
+    .map((v) => Number(v.price))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  if (!nums.length) return "";
+  const min = Math.min(...nums);
+  const max = Math.max(...nums);
+  return min === max ? `Rs. ${min.toLocaleString()}` : `Rs. ${min.toLocaleString()} - Rs. ${max.toLocaleString()}`;
+}
+
 function fillCustomTemplate(template: string, product?: FollowUpProduct | null, customerName: string = ""): string {
+  if (/{product_name}/i.test(template) && !product?.name) {
+    return "";
+  }
+  const verifiedPrice = formatVerifiedPrice(product);
+  if (/{price}/i.test(template) && !verifiedPrice) {
+    return "";
+  }
   return template
-    .replace(/{product_name}/g, product?.name || "our product")
-    .replace(/{customer_name}/g, customerName || "there")
-    .replace(/{price}/g, product?.price ? `Rs. ${product.price.toLocaleString()}` : "");
+    .replace(/{product_name}/gi, product?.name || "")
+    .replace(/{customer_name}/gi, customerName || "there")
+    .replace(/{price}/gi, verifiedPrice)
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /** Check if current time in Asia/Colombo is within daytime hours (9 AM - 8 PM). */
@@ -455,7 +560,12 @@ interface QualifiedCandidate {
   score: number;
   lastCustomerAt: number;
   messageText: string;
-  prefix: string;
+  kind: "checkout" | "interest" | "custom";
+  source: "custom" | "template";
+  productId: string | null;
+  productName: string | null;
+  reminderKind: string | null;
+  chatLabelIds: string | null;
 }
 
 /**
@@ -504,16 +614,42 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
     // 3. Daily Cap: strictly at most 30 messages per day per shop (resets at 9:00 AM today)
     const MAX_DAILY_FOLLOWUPS = 30;
     const windowStart = getTodayWindowStart();
-    const { data: recentSent } = await sb
-      .from("messages")
-      .select("id")
-      .eq("shop_id", shopId)
-      .eq("role", "model")
-      .like("content", "[% reminder]%")
-      .gte("created_at", windowStart)
-      .limit(35);
+    let sentToday = 0;
+    try {
+      const { data: recentMeta, error: metaErr } = await sb
+        .from("messages")
+        .select("id")
+        .eq("shop_id", shopId)
+        .eq("role", "model")
+        .or("content.like.[% reminder]%,metadata->>is_followup_reminder.eq.true")
+        .gte("created_at", windowStart)
+        .limit(35);
+      if (!metaErr && recentMeta) {
+        sentToday = recentMeta.length;
+      } else {
+        const [{ data: recentLegacy }, { data: recentCust }] = await Promise.all([
+          sb
+            .from("messages")
+            .select("id")
+            .eq("shop_id", shopId)
+            .eq("role", "model")
+            .like("content", "[% reminder]%")
+            .gte("created_at", windowStart)
+            .limit(35),
+          sb
+            .from("customers")
+            .select("id")
+            .eq("shop_id", shopId)
+            .eq("checkout_reminder_sent", true)
+            .gte("checkout_reminder_at", windowStart)
+            .limit(35),
+        ]);
+        sentToday = Math.max(recentLegacy?.length ?? 0, recentCust?.length ?? 0);
+      }
+    } catch {
+      sentToday = 0;
+    }
 
-    const sentToday = recentSent?.length ?? 0;
     const room = Math.max(0, MAX_DAILY_FOLLOWUPS - sentToday);
 
     if (room <= 0) {
@@ -525,13 +661,35 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
     const waitHours = [4, 6, 12].includes(Number(biz.followup_wait_hours)) ? Number(biz.followup_wait_hours) : 4;
     const quietWindowMs = waitHours * 3_600_000;
 
-    // 4. Fetch Products for catalog matching
+    // 4. Fetch Products for catalog matching (strictly scoped to this shop & active)
     const { data: productsRaw } = await sb
       .from("products")
-      .select("name, price, price_variants, description")
+      .select("id, shop_id, name, price, price_variants, description, is_active")
       .eq("shop_id", shopId)
       .eq("is_active", true);
-    const products: FollowUpProduct[] = (productsRaw ?? []).filter((p) => p.name);
+    const products: FollowUpProduct[] = ((productsRaw ?? []) as FollowUpProduct[]).filter(
+      (p) => Boolean(p.name) && p.is_active !== false && (!p.shop_id || p.shop_id === shopId),
+    );
+
+    // Optional pre-load of persisted customer product interests (fails open before SQL migration)
+    const persistedByPhone = new Map<string, PersistedProductInterest[]>();
+    try {
+      const { data: interestsRaw, error: intErr } = await sb
+        .from("customer_product_interests")
+        .select("id, shop_id, customer_id, phone_number, product_id, product_name, variant_label, quantity, last_customer_interest_at, source_customer_message_id, status, checkout_context, followup_sent_at")
+        .eq("shop_id", shopId)
+        .order("last_customer_interest_at", { ascending: false })
+        .limit(200);
+      if (!intErr && interestsRaw) {
+        for (const row of interestsRaw as PersistedProductInterest[]) {
+          const list = persistedByPhone.get(row.phone_number) ?? [];
+          list.push(row);
+          persistedByPhone.set(row.phone_number, list);
+        }
+      }
+    } catch {
+      // safe pre-migration fallback
+    }
 
     // 5. Fetch Candidates Due for this shop (fetch up to 60 to evaluate and pick the best)
     const { data: candidates, error: cErr } = await sb
@@ -552,20 +710,66 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
     totalExamined += candidates.length;
     const qualified: QualifiedCandidate[] = [];
 
+    const loadCandidateMsgs = async (phoneVariants: string[]): Promise<CronMessageRow[]> => {
+      const { data, error } = await sb
+        .from("messages")
+        .select("id, role, content, created_at, metadata")
+        .eq("shop_id", shopId)
+        .in("phone_number", phoneVariants)
+        .order("created_at", { ascending: false })
+        .limit(40);
+      if (!error && data) return data as CronMessageRow[];
+      const { data: fallback } = await sb
+        .from("messages")
+        .select("role, content, created_at")
+        .eq("shop_id", shopId)
+        .in("phone_number", phoneVariants)
+        .order("created_at", { ascending: false })
+        .limit(40);
+      return (fallback ?? []) as CronMessageRow[];
+    };
+
+    const gatherPersisted = (phoneVariants: string[]): PersistedProductInterest[] => {
+      const items: PersistedProductInterest[] = [];
+      for (const pv of phoneVariants) {
+        const hit = persistedByPhone.get(pv);
+        if (hit) items.push(...hit);
+      }
+      return items.sort(
+        (a, b) => Date.parse(b.last_customer_interest_at) - Date.parse(a.last_customer_interest_at),
+      );
+    };
+
+    const buildLeadMessage = (evalResult: Extract<CandidateEvalResult, { eligible: true }>) => {
+      const { matchedProduct, topics, language, isCheckoutStage } = evalResult;
+      if (biz.followup_custom_enabled && biz.followup_custom_template) {
+        const customText = fillCustomTemplate(biz.followup_custom_template, matchedProduct);
+        return {
+          messageText: customText,
+          kind: "custom" as const,
+          source: "custom" as const,
+        };
+      }
+      const messageText = templateFollowUp(
+        matchedProduct,
+        topics,
+        language,
+        isCheckoutStage ? "checkout" : "interest",
+      );
+      return {
+        messageText,
+        kind: (isCheckoutStage ? "checkout" : "interest") as "checkout" | "interest",
+        source: "template" as const,
+      };
+    };
+
     for (const c of candidates) {
       try {
         const phone = c.phone_number;
         const phoneVariants = buildPhoneVariants(phone);
 
-        // Fetch recent chat messages and recent orders across all phone format variants in parallel
-        const [{ data: rawMsgs }, { data: recentOrdersRaw }] = await Promise.all([
-          sb
-            .from("messages")
-            .select("role, content, created_at")
-            .eq("shop_id", shopId)
-            .in("phone_number", phoneVariants)
-            .order("created_at", { ascending: false })
-            .limit(40),
+        const [rawMsgs, { data: recentOrdersRaw }] = await Promise.all([
+          loadCandidateMsgs(phoneVariants),
           sb
             .from("orders")
             .select("id, status, created_at")
@@ -576,12 +780,14 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
         ]);
 
         const evaluation = evaluateFollowUpCandidate({
-          msgsNewestFirst: (rawMsgs ?? []) as CronMessageRow[],
+          msgsNewestFirst: rawMsgs,
           ordersNewestFirst: (recentOrdersRaw ?? []) as CronOrderRow[],
           products,
           quietWindowMs,
           reminderKind: c.reminder_kind,
           chatLabelIds: (c as { chat_label_ids?: string | null }).chat_label_ids ?? null,
+          shopId,
+          persistedInterests: gatherPersisted(phoneVariants),
           now,
         });
 
@@ -603,30 +809,23 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
           continue;
         }
 
-        const { matchedProduct, topics, language, isCheckoutStage, score, lastCustomerAt } = evaluation;
-
-        // Formulate follow-up message text
-        let messageText = "";
-        let prefix = isCheckoutStage ? "[checkout reminder]" : "[interest reminder]";
-
-        if (biz.followup_custom_enabled && biz.followup_custom_template) {
-          messageText = fillCustomTemplate(biz.followup_custom_template, matchedProduct);
-          prefix = "[custom reminder]";
-        } else {
-          messageText = templateFollowUp(matchedProduct, topics, language, isCheckoutStage ? "checkout" : "interest");
-        }
-
-        if (!messageText.trim()) {
+        const built = buildLeadMessage(evaluation);
+        if (!built.messageText.trim()) {
           continue;
         }
 
         qualified.push({
           candidateId: c.id,
           phone,
-          score,
-          lastCustomerAt,
-          messageText,
-          prefix,
+          score: evaluation.score,
+          lastCustomerAt: evaluation.lastCustomerAt,
+          messageText: built.messageText,
+          kind: built.kind,
+          source: built.source,
+          productId: evaluation.matchedProduct?.id ?? null,
+          productName: evaluation.matchedProduct?.name ?? null,
+          reminderKind: c.reminder_kind ?? null,
+          chatLabelIds: (c as { chat_label_ids?: string | null }).chat_label_ids ?? null,
         });
       } catch (err: unknown) {
         console.warn(`[followup-cron] Failed to evaluate customer ${c.id}:`, (err as Error)?.message || err);
@@ -642,20 +841,129 @@ export async function runFollowUpJob(): Promise<{ examined: number; queued: numb
 
     for (const lead of toSend) {
       try {
-        // Queue directly into Baileys session's anti-ban proactive queue
-        // (automatically paces with 20s-60s jitter and simulates human typing)
-        await session.queueProactive(lead.phone, lead.messageText);
+        const phoneVariants = buildPhoneVariants(lead.phone);
 
-        // Record in messages table
-        await sb.from("messages").insert({
+        // Live pre-send revalidation before queuing
+        const [freshMsgs, { data: freshOrders }, { data: freshCust }] = await Promise.all([
+          loadCandidateMsgs(phoneVariants),
+          sb
+            .from("orders")
+            .select("id, status, created_at")
+            .eq("shop_id", shopId)
+            .in("customer_phone", phoneVariants)
+            .order("created_at", { ascending: false })
+            .limit(10),
+          sb
+            .from("customers")
+            .select("checkout_reminder_sent, chat_label_ids")
+            .eq("id", lead.candidateId)
+            .maybeSingle(),
+        ]);
+
+        if (!freshCust || freshCust.checkout_reminder_sent === true) {
+          continue;
+        }
+
+        const freshEval = evaluateFollowUpCandidate({
+          msgsNewestFirst: freshMsgs,
+          ordersNewestFirst: (freshOrders ?? []) as CronOrderRow[],
+          products,
+          quietWindowMs,
+          reminderKind: lead.reminderKind,
+          chatLabelIds: (freshCust as { chat_label_ids?: string | null }).chat_label_ids ?? lead.chatLabelIds,
+          shopId,
+          persistedInterests: gatherPersisted(phoneVariants),
+          now: Date.now(),
+        });
+
+        if (!freshEval.eligible) {
+          if (freshEval.clearReminder) {
+            const patch: Record<string, unknown> = {
+              checkout_reminder_sent: true,
+              checkout_reminder_at: null,
+              reminder_kind: null,
+            };
+            if (freshEval.ensureOrderedLabel) {
+              patch.chat_label_ids = applyOrderedLabelString(
+                (freshCust as { chat_label_ids?: string | null }).chat_label_ids ?? lead.chatLabelIds,
+              );
+            }
+            await sb.from("customers").update(patch).eq("id", lead.candidateId);
+            totalSkipped++;
+          }
+          continue;
+        }
+
+        let finalText = lead.messageText;
+        let finalProductId = lead.productId;
+        let finalProductName = lead.productName;
+        let finalKind = lead.kind;
+        let finalSource = lead.source;
+
+        if ((freshEval.matchedProduct?.name ?? null) !== lead.productName || (freshEval.matchedProduct?.id ?? null) !== lead.productId) {
+          const rebuilt = buildLeadMessage(freshEval);
+          if (!rebuilt.messageText.trim()) continue;
+          finalText = rebuilt.messageText;
+          finalProductId = freshEval.matchedProduct?.id ?? null;
+          finalProductName = freshEval.matchedProduct?.name ?? null;
+          finalKind = rebuilt.kind;
+          finalSource = rebuilt.source;
+        }
+
+        // Atomic conditional claim so concurrent cron runners cannot double-send
+        const { data: claimed } = await sb
+          .from("customers")
+          .update({ checkout_reminder_sent: true })
+          .eq("id", lead.candidateId)
+          .or("checkout_reminder_sent.eq.false,checkout_reminder_sent.is.null")
+          .select("id")
+          .maybeSingle();
+
+        if (!claimed?.id) {
+          continue;
+        }
+
+        try {
+          // Queue directly into Baileys session's anti-ban proactive queue
+          // (automatically paces with 20s-60s jitter and simulates human typing)
+          await session.queueProactive(lead.phone, finalText);
+        } catch (queueErr) {
+          await sb.from("customers").update({ checkout_reminder_sent: false }).eq("id", lead.candidateId);
+          throw queueErr;
+        }
+
+        // Record in messages table WITHOUT exposing internal [interest reminder] marker
+        const metadata = {
+          is_followup_reminder: true,
+          reminder_kind: finalKind,
+          source: finalSource,
+          product_id: finalProductId,
+          product_name: finalProductName,
+        };
+        const { error: msgErr } = await sb.from("messages").insert({
           shop_id: shopId,
           phone_number: lead.phone,
           role: "model",
-          content: `${lead.prefix} ${lead.messageText}`,
+          content: finalText,
+          metadata,
         });
+        if (msgErr && /metadata|PGRST204|42703/i.test(msgErr.message)) {
+          await sb.from("messages").insert({
+            shop_id: shopId,
+            phone_number: lead.phone,
+            role: "model",
+            content: finalText,
+          });
+        }
 
-        // Mark sent
-        await sb.from("customers").update({ checkout_reminder_sent: true }).eq("id", lead.candidateId);
+        try {
+          await sb
+            .from("customers")
+            .update({ last_followup_sent_at: new Date().toISOString() })
+            .eq("id", lead.candidateId);
+        } catch {
+          // safe pre-migration fallback
+        }
 
         totalQueued++;
         console.log(`[followup-cron] ✅ Queued best lead (score ${lead.score}) for ${biz.business_name} -> ${lead.phone}`);

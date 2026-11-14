@@ -183,28 +183,68 @@ export function countNamedProducts<T extends NamedProduct>(text: string, product
 }
 
 const SKIP_ROW = /^(?:https?:\/\/\S+|wa-media:\S+)$|^\[(?:interest|checkout|custom)\s+reminder\]/i;
+const BOT_UNSOLICITED_SUGGESTION = /\b(?:instead|other\s*items|also\s*(?:have|recommend|available)|might\s*like|recommend(?:ed)?\s*for\s*you)\b|වෙනත්\s*items|වෙන\s*(?:items?|ඒවා)/i;
+
+function isCustomerRow(m: { role?: string; from?: string }): boolean {
+  if (m.role) return m.role === "user";
+  if (m.from) return m.from === "customer";
+  return false;
+}
 
 /**
- * The product the conversation is currently about: the most recent message
- * (customer OR shop) that clearly names exactly one product. Menus and
- * catalogue lists (3+ products) are skipped, and follow-up reminders are never
- * used as evidence. Returns undefined rather than guessing.
+ * The product the conversation is currently about, giving STRICT priority to
+ * what the CUSTOMER explicitly expressed interest in:
+ * 1. Scans customer messages newest-first; the latest unambiguous match wins.
+ * 2. Only when no customer message unambiguously names a product (and
+ *    `customerOnly` is false), checks a single-product bot response directly
+ *    answering an adjacent/matching customer inquiry.
  */
 export function findDiscussedProduct<T extends NamedProduct>(
   messagesNewestFirst: Array<{ role?: string; from?: string; content?: string | null; text?: string | null }>,
   products: T[] | null | undefined,
-  opts: { limit?: number; resolve?: (text: string) => T | undefined } = {},
+  opts: { limit?: number; resolve?: (text: string) => T | undefined; customerOnly?: boolean } = {},
 ): T | undefined {
   if (!products?.length) return undefined;
   const limit = opts.limit ?? 14;
-  let seen = 0;
-  for (const m of messagesNewestFirst) {
+  const window = messagesNewestFirst.slice(0, limit * 2);
+
+  let seenCust = 0;
+  for (const m of window) {
+    if (!isCustomerRow(m)) continue;
     const text = String(m.content ?? m.text ?? "").trim();
     if (!text || SKIP_ROW.test(text)) continue;
-    if (++seen > limit) break;
+    if (++seenCust > limit) break;
     if (countNamedProducts(text, products) >= 3) continue;
     const hit = opts.resolve ? opts.resolve(text) : matchProductInText(text, products);
     if (hit) return hit;
+  }
+
+  if (opts.customerOnly) return undefined;
+
+  let seenBot = 0;
+  for (let i = 0; i < window.length; i++) {
+    const m = window[i];
+    if (isCustomerRow(m)) continue;
+    const text = String(m.content ?? m.text ?? "").trim();
+    if (!text || SKIP_ROW.test(text) || /^\[ORDER_CREATED\]/i.test(text)) continue;
+    if (++seenBot > limit) break;
+    if (BOT_UNSOLICITED_SUGGESTION.test(text)) continue;
+    if (countNamedProducts(text, products) !== 1) continue;
+    const hit = opts.resolve ? opts.resolve(text) : matchProductInText(text, products);
+    if (!hit) continue;
+
+    const hitTokens = new Set(tokenize(hit.name));
+    const earlierCust = window.slice(i + 1).find((row) => {
+      if (!isCustomerRow(row)) return false;
+      const cText = String(row.content ?? row.text ?? "").trim();
+      return Boolean(cText && !/^https?:\/\/\S+$/i.test(cText));
+    });
+    if (!earlierCust) continue;
+    const custText = String(earlierCust.content ?? earlierCust.text ?? "").trim();
+    const custTokens = tokenize(custText);
+    const sharesToken = custTokens.some((t) => hitTokens.has(t));
+    const directReply = i + 1 < window.length && window[i + 1] === earlierCust;
+    if (sharesToken || directReply) return hit;
   }
   return undefined;
 }

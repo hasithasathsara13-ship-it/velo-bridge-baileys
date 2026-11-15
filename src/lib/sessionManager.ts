@@ -943,7 +943,7 @@ export class Session {
           if (oldest !== undefined) this.lastMissedCallReplyAt.delete(oldest);
         }
 
-        console.log(`[call] Unanswered call detected via call-event (${call.status}) from ${phone}`);
+        console.log(`[call] Unanswered call detected via call-event (${call.status}${reason ? `/${reason}` : ""}) from ${phone}`);
         void this.handleMissedCallAutoReply(phone);
       }
     }

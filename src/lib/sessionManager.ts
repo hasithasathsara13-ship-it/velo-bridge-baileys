@@ -895,7 +895,7 @@ export class Session {
       // An answered call on the phone arrives here as terminate with
       // reason "accepted_elsewhere", not as "accept". That must not send
       // the busy message. A plain terminate is the call ending, not a miss.
-      const reason = String(call.reason || "").toLowerCase();
+      const reason = String((call as { reason?: string }).reason || "").toLowerCase();
       const answered =
         call.status === "accept" ||
         call.status === "preaccept" ||

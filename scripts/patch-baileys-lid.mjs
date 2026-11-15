@@ -21,8 +21,39 @@ if (!fs.existsSync(pkgPath)) {
 }
 
 const ver = JSON.parse(fs.readFileSync(pkgPath, "utf8")).version || "";
+
+// Keep the call terminate reason. Without it an answered call looks like a miss.
+const recvFile = path.join(path.dirname(pkgPath), "lib", "Socket", "messages-recv.js");
+const callTypeFile = path.join(path.dirname(pkgPath), "lib", "Types", "Call.d.ts");
+if (fs.existsSync(recvFile)) {
+  const recv = fs.readFileSync(recvFile, "utf8");
+  const withoutReason = `                offline: !!attrs.offline,
+                status
+            };`;
+  const withReason = `                offline: !!attrs.offline,
+                status,
+                reason: infoChild.attrs.reason
+            };`;
+  if (recv.includes(withoutReason)) {
+    fs.writeFileSync(recvFile, recv.replace(withoutReason, withReason));
+    console.log("[patch-baileys-lid] call events now include reason");
+  }
+}
+if (fs.existsSync(callTypeFile)) {
+  const types = fs.readFileSync(callTypeFile, "utf8");
+  if (!types.includes("reason?:")) {
+    fs.writeFileSync(
+      callTypeFile,
+      types.replace(
+        "    latencyMs?: number;",
+        "    latencyMs?: number;\n    reason?: string;",
+      ),
+    );
+  }
+}
+
 if (String(ver).startsWith("7.")) {
-  console.log(`[patch-baileys-lid] skip (baileys ${ver})`);
+  console.log(`[patch-baileys-lid] skip lid revert (baileys ${ver})`);
   process.exit(0);
 }
 

@@ -892,17 +892,25 @@ export class Session {
         state.callerPn = call.callerPn;
       }
 
-      // If the call was answered by the owner on their phone, never send the missed-call message!
-      if (call.status === "accept" || call.status === "preaccept") {
+      // An answered call on the phone arrives here as terminate with
+      // reason "accepted_elsewhere", not as "accept". That must not send
+      // the busy message. A plain terminate is the call ending, not a miss.
+      const reason = String(call.reason || "").toLowerCase();
+      const answered =
+        call.status === "accept" ||
+        call.status === "preaccept" ||
+        reason.includes("accept");
+      if (answered) {
         state.answered = true;
         continue;
       }
 
-      // Missed call: ended automatically without answering (timeout), declined/ended by owner (reject), or terminated without answering
-      const isMissed =
-        call.status === "timeout" ||
+      const ownerCut =
         call.status === "reject" ||
-        (call.status === "terminate" && !state.answered);
+        reason.includes("reject") ||
+        reason.includes("declin");
+      const notAnswered = call.status === "timeout" || reason === "timeout" || reason === "busy";
+      const isMissed = (ownerCut || notAnswered) && !state.answered;
 
       if (isMissed && !state.answered && !state.handled) {
         state.handled = true;

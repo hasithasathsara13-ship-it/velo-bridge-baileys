@@ -731,8 +731,9 @@ export class Session {
       }
     });
 
-    // Handle incoming calls (missed calls / rejected without answering)
+    // Handle incoming calls (missed calls / rejected without answering) — currently disabled for later implementation
     sock.ev.on("call", (calls: WACallEvent[]) => {
+      if (!Session.ENABLE_MISSED_CALL_AUTO_REPLY) return;
       this.onCallUpdate(calls).catch((err) => console.error(`[session ${this.info.shopId}] call error:`, err));
     });
 
@@ -870,12 +871,15 @@ export class Session {
    *  Resets once the socket shows a QR or opens. If connect() itself throws
    *  (e.g. a disk error) no 'close' event will ever arrive, so retry here
    *  instead of leaving the session stuck on "connecting" forever. */
+  /** Feature flag for unanswered/ended call auto-reply (disabled for now; restore to true later). */
+  private static readonly ENABLE_MISSED_CALL_AUTO_REPLY = false;
   /** Track incoming calls to detect if answered or missed. */
   private callStates = new Map<string, { answered: boolean; handled: boolean; callerPn?: string; timestamp: number }>();
   /** Cooldown: max 1 missed-call auto-reply per customer phone every 10 minutes. */
   private lastMissedCallReplyAt = new Map<string, number>();
 
   private async onCallUpdate(calls: WACallEvent[]): Promise<void> {
+    if (!Session.ENABLE_MISSED_CALL_AUTO_REPLY) return;
     for (const call of calls || []) {
       const callId = call?.id;
       if (!callId) continue;
@@ -950,6 +954,7 @@ export class Session {
   }
 
   private async handleMissedCallAutoReply(phone: string): Promise<void> {
+    if (!Session.ENABLE_MISSED_CALL_AUTO_REPLY) return;
     try {
       const sb = getSupabase();
       const shopId = this.info.shopId;
@@ -1369,6 +1374,10 @@ export class Session {
         if (this.processedMsgIds.has(msgId)) return;
         this.processedMsgIds.add(msgId);
       }
+      // Missed/unanswered call auto-reply is currently disabled for later implementation;
+      // keep consuming the stub so it is not processed as a normal chat message.
+      if (!Session.ENABLE_MISSED_CALL_AUTO_REPLY) return;
+
       // Check message age: ignore stubs older than 3 minutes (e.g. during sync/reconnect)
       const rawTs = Number(msg.messageTimestamp || 0);
       const tsMs = rawTs > 1e12 ? rawTs : rawTs * 1000;
